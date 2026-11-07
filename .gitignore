@@ -30,3 +30,8 @@ media/
 # caches
 .ruff_cache/
 *.tsbuildinfo
+
+# session / agent prompts
+SESSION-LOG.md
+*-prompt.txt
+

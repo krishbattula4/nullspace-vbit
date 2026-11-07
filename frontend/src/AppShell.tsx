@@ -12,6 +12,7 @@ export function AppShell() {
         <nav>
           <Link to="/login">Login</Link>
           <Link to="/register">Register</Link>
+          <Link to="/spike">Spike</Link>
         </nav>
         <span className={`health health-${health.state}`} title={health.detail}>
           backend: {health.state}
