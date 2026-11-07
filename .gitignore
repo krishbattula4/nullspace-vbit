@@ -1,0 +1,32 @@
+# env / secrets
+.env
+*.pem
+*.key
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# node
+node_modules/
+dist/
+.vite/
+
+# os / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# docker volumes / media
+pgdata/
+media/
+
+# caches
+.ruff_cache/
+*.tsbuildinfo
