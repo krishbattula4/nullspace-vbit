@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nullspace.chat/schemas/prekey-bundle.schema.json",
+  "title": "PublicPreKeyBundle",
+  "description": "Public prekey bundle uploaded to the server during key provisioning and fetched by clients to establish E2EE sessions.",
+  "type": "object",
+  "required": [
+    "userId",
+    "registrationId",
+    "identityKey",
+    "signedPreKey",
+    "oneTimePreKeys",
+    "createdAt"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "userId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The unique identifier of the user who owns this bundle."
+    },
+    "registrationId": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The Signal Protocol local registration ID (1..16380)."
+    },
+    "identityKey": {
+      "type": "string",
+      "description": "Base64-encoded 33-byte Curve25519 identity public key (with 0x05 prefix)."
+    },
+    "signedPreKey": {
+      "type": "object",
+      "required": ["keyId", "publicKey", "signature"],
+      "additionalProperties": false,
+      "description": "The medium-term signed prekey and its cryptographic signature.",
+      "properties": {
+        "keyId": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Unique positive integer identifier for the signed prekey."
+        },
+        "publicKey": {
+          "type": "string",
+          "description": "Base64-encoded 33-byte Curve25519 signed prekey public key."
+        },
+        "signature": {
+          "type": "string",
+          "description": "Base64-encoded 64-byte Ed25519 signature over the signed prekey public key."
+        }
+      }
+    },
+    "oneTimePreKeys": {
+      "type": "array",
+      "description": "List of available one-time prekeys. May be empty if exhausted.",
+      "items": {
+        "type": "object",
+        "required": ["keyId", "publicKey"],
+        "additionalProperties": false,
+        "properties": {
+          "keyId": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Unique positive integer identifier for the one-time prekey."
+          },
+          "publicKey": {
+            "type": "string",
+            "description": "Base64-encoded 33-byte Curve25519 one-time prekey public key."
+          }
+        }
+      }
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp of when this bundle was constructed."
+    }
+  }
+}

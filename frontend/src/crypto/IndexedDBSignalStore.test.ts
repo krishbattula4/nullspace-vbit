@@ -79,9 +79,12 @@ describe("IndexedDBSignalStore", () => {
     const loadedPreKeyByStr = await store.loadPreKey("101");
     expect(loadedPreKeyByStr).toBeDefined();
 
+    expect(await store.listPreKeyIds()).toEqual([101]);
+
     await store.removePreKey(101);
     expect(await store.loadPreKey(101)).toBeUndefined();
     expect(await store.loadPreKey("101")).toBeUndefined();
+    expect(await store.listPreKeyIds()).toEqual([]);
 
     // 5. Signed PreKeys
     const signedKeyPair = {
@@ -97,8 +100,11 @@ describe("IndexedDBSignalStore", () => {
     expect(loadedSigned!.signature).toBeDefined();
     expect(areArrayBuffersEqual(loadedSigned!.signature!, signature)).toBe(true);
 
+    expect(await store.getSignedPreKeyIds()).toEqual([202]);
+
     await store.removeSignedPreKey(202);
     expect(await store.loadSignedPreKey(202)).toBeUndefined();
+    expect(await store.getSignedPreKeyIds()).toEqual([]);
 
     // 6. Sessions
     await store.storeSession("charlie.1", "session-record-1");
