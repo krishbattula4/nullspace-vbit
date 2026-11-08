@@ -10,6 +10,16 @@ import {
   type StorageType,
 } from "@privacyresearch/libsignal-protocol-typescript";
 
+export interface SignalStoreWithIdentity extends StorageType {
+  setIdentityKeyPair(keyPair: KeyPairType): Promise<void>;
+  setLocalRegistrationId(id: number): Promise<void>;
+  wipe?(): Promise<void>;
+}
+
+export type SignalStoreFactory = (
+  userId: string,
+) => SignalStoreWithIdentity | Promise<SignalStoreWithIdentity>;
+
 function areArrayBuffersEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
   if (a.byteLength !== b.byteLength) return false;
   const viewA = new Uint8Array(a);
@@ -20,11 +30,14 @@ function areArrayBuffersEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
   return true;
 }
 
-export class InMemorySignalProtocolStore implements StorageType {
+export class InMemorySignalProtocolStore implements SignalStoreWithIdentity {
   private identityKeyPair?: KeyPairType;
   private registrationId?: number;
   private readonly preKeys = new Map<string | number, KeyPairType>();
-  private readonly signedPreKeys = new Map<string | number, KeyPairType>();
+  private readonly signedPreKeys = new Map<
+    string | number,
+    KeyPairType & { signature?: ArrayBuffer }
+  >();
   private readonly sessions = new Map<string, SessionRecordType>();
   private readonly identities = new Map<string, ArrayBuffer>();
 
@@ -47,7 +60,7 @@ export class InMemorySignalProtocolStore implements StorageType {
   async isTrustedIdentity(
     identifier: string,
     identityKey: ArrayBuffer,
-    direction: Direction,
+    direction?: Direction,
   ): Promise<boolean> {
     void identifier;
     void identityKey;
@@ -90,12 +103,23 @@ export class InMemorySignalProtocolStore implements StorageType {
     return this.sessions.get(encodedAddress);
   }
 
-  async loadSignedPreKey(keyId: number | string): Promise<KeyPairType | undefined> {
+  async loadSignedPreKey(
+    keyId: number | string,
+  ): Promise<(KeyPairType & { signature?: ArrayBuffer }) | undefined> {
     return this.signedPreKeys.get(keyId);
   }
 
-  async storeSignedPreKey(keyId: number | string, keyPair: KeyPairType): Promise<void> {
-    this.signedPreKeys.set(keyId, keyPair);
+  async storeSignedPreKey(
+    keyId: number | string,
+    keyPair: KeyPairType,
+    signature?: ArrayBuffer,
+  ): Promise<void> {
+    const sig = signature ?? (keyPair as { signature?: ArrayBuffer }).signature;
+    this.signedPreKeys.set(keyId, {
+      pubKey: keyPair.pubKey,
+      privKey: keyPair.privKey,
+      signature: sig,
+    });
   }
 
   async removeSignedPreKey(keyId: number | string): Promise<void> {
@@ -103,11 +127,13 @@ export class InMemorySignalProtocolStore implements StorageType {
   }
 }
 
-export async function runSpike(): Promise<{ library: string; decrypted: string }> {
+export async function runSpike(
+  storeFactory?: SignalStoreFactory,
+): Promise<{ library: string; decrypted: string }> {
   const library = "@privacyresearch/libsignal-protocol-typescript";
 
   // 1. Generate identity, signed prekey, and one-time prekey for Bob
-  const bobStore = new InMemorySignalProtocolStore();
+  const bobStore = storeFactory ? await storeFactory("bob") : new InMemorySignalProtocolStore();
   const bobRegistrationId = KeyHelper.generateRegistrationId();
   const bobIdentityKeyPair = await KeyHelper.generateIdentityKeyPair();
   await bobStore.setLocalRegistrationId(bobRegistrationId);
@@ -115,7 +141,11 @@ export async function runSpike(): Promise<{ library: string; decrypted: string }
 
   const signedPreKeyId = 1;
   const bobSignedPreKey = await KeyHelper.generateSignedPreKey(bobIdentityKeyPair, signedPreKeyId);
-  await bobStore.storeSignedPreKey(signedPreKeyId, bobSignedPreKey.keyPair);
+  await bobStore.storeSignedPreKey(
+    signedPreKeyId,
+    bobSignedPreKey.keyPair,
+    bobSignedPreKey.signature,
+  );
 
   const oneTimePreKeyId = 1;
   const bobPreKey = await KeyHelper.generatePreKey(oneTimePreKeyId);
@@ -137,7 +167,7 @@ export async function runSpike(): Promise<{ library: string; decrypted: string }
   };
 
   // 3. Initialize Alice and establish session with Bob
-  const aliceStore = new InMemorySignalProtocolStore();
+  const aliceStore = storeFactory ? await storeFactory("alice") : new InMemorySignalProtocolStore();
   const aliceRegistrationId = KeyHelper.generateRegistrationId();
   const aliceIdentityKeyPair = await KeyHelper.generateIdentityKeyPair();
   await aliceStore.setLocalRegistrationId(aliceRegistrationId);

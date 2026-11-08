@@ -9,5 +9,8 @@ export default defineConfig({
     alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
   },
   server: { port: 5173 },
-  test: { environment: "node" },
+  test: {
+    environment: "node",
+    setupFiles: ["./src/test/setup.ts"],
+  },
 });
