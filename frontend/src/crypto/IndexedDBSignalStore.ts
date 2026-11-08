@@ -278,6 +278,19 @@ export class IndexedDBSignalStore implements StorageType {
     await tx.done;
   }
 
+  async listPreKeyIds(): Promise<number[]> {
+    const db = await this.getDb();
+    const keys = await db.getAllKeys("preKeys");
+    const unique = new Set<number>();
+    for (const k of keys) {
+      const n = typeof k === "number" ? k : Number(k);
+      if (Number.isInteger(n) && n > 0) {
+        unique.add(n);
+      }
+    }
+    return Array.from(unique).sort((a, b) => a - b);
+  }
+
   // --- Signed PreKeys ---
 
   async loadSignedPreKey(
@@ -330,6 +343,19 @@ export class IndexedDBSignalStore implements StorageType {
       await tx.store.delete(alt as any);
     }
     await tx.done;
+  }
+
+  async getSignedPreKeyIds(): Promise<number[]> {
+    const db = await this.getDb();
+    const keys = await db.getAllKeys("signedPreKeys");
+    const unique = new Set<number>();
+    for (const k of keys) {
+      const n = typeof k === "number" ? k : Number(k);
+      if (Number.isInteger(n) && n > 0) {
+        unique.add(n);
+      }
+    }
+    return Array.from(unique).sort((a, b) => a - b);
   }
 
   // --- Sessions ---
