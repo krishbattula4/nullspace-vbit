@@ -1,8 +1,27 @@
 # Wire protocol (draft, completed in task P2.2)
 
 All WebSocket frames are JSON objects with a `v` (protocol version, currently 1) and a `type`.
-Message bodies are **always ciphertext**: base64 of the libsignal output, with `ctype` 3 (PreKeySignalMessage) or 2 (SignalMessage).
+Message bodies are **always ciphertext**: base64 of the libsignal output, with `ctype` 3 (`PreKeyWhisperMessage`) or 1 (`WhisperMessage`).
 The server never receives, stores or forwards plaintext.
+
+### Device ID Rule
+
+In Nullspace v1, multi-device support is out of scope. Every user has exactly one device, and the Signal Protocol device ID is **always 1** across all addresses and session operations (`new SignalProtocolAddress(userId, 1)`).
+
+### CipherEnvelope Shape (MESSAGE event)
+
+Client-to-client payloads transmitted in the `MESSAGE` and `EDIT` frames correspond to the `CipherEnvelope` structure produced by `SessionManager`:
+
+```typescript
+type CipherEnvelope = {
+  type: 1 | 3; // 3 = PreKeyWhisperMessage (session initiation via X3DH), 1 = WhisperMessage (active ratchet)
+  body: string; // standard base64 encoding of the binary message bytes
+};
+```
+
+- **`ctype`**: Mapped directly from `CipherEnvelope.type` (`3` for initial handshake message establishing the session, `1` for subsequent ratcheted messages).
+- **`body`**: Mapped directly from `CipherEnvelope.body` (standard base64 string derived from raw binary cipher bytes).
+
 
 | type | direction | fields | notes |
 |---|---|---|---|
@@ -70,5 +89,16 @@ All public keys are Curve25519 public keys prefixed with `0x05` (33 bytes raw, b
   "createdAt": "2026-11-08T12:00:00.000Z"
 }
 ```
+
+## Safety number
+
+Safety numbers provide out-of-band visible key verification between two users to verify that their end-to-end encrypted session is not subject to a man-in-the-middle (MITM) attack or identity key substitution.
+
+- **Format**: 60 decimal digits, displayed as 12 groups of 5 digits separated by spaces across 3 lines of 4 groups each.
+- **Algorithm**: Computed using libsignal's `FingerprintGenerator` configured with 5200 iterations (`FINGERPRINT_ITERATIONS = 5200`, iterative SHA-512 hashing).
+- **Identifier**: `userId` encoded as UTF-8 bytes (the stable identifier) along with each user's 33-byte Curve25519 identity public key.
+- **Symmetry**: Identical on both devices when neither identity key has been substituted. `FingerprintGenerator.createFor` lexicographically sorts the two 30-digit halves before concatenating, ensuring identical digits regardless of which user is local or remote.
+- **Security & Privacy**: The safety number never leaves the client device over the wire. It is never sent to the server. Verification is conducted strictly out-of-band (in person, over a secure voice call, or by scanning a QR code in task P4.2).
+
 
 

@@ -13,6 +13,11 @@ import { IndexedDBSignalStore } from "./IndexedDBSignalStore";
 import { provisionKeys } from "./provision";
 import { InMemoryBundleProvider } from "./bundleProvider";
 import { SessionManager } from "./session";
+import {
+  safetyNumberWith,
+  formatSafetyNumber,
+  safetyNumbersMatch,
+} from "./safetyNumber";
 
 export interface SignalStoreWithIdentity extends StorageType {
   setIdentityKeyPair(keyPair: KeyPairType): Promise<void>;
@@ -215,6 +220,9 @@ export interface PersistentSpikeResult {
   bobDecrypted: string;
   aliceToBobEnvelopeType: 1 | 3;
   bobToAliceEnvelopeType: 1 | 3;
+  aliceSafetyNumberFormatted?: string;
+  bobSafetyNumberFormatted?: string;
+  safetyNumbersMatch?: boolean;
 }
 
 export async function runPersistentSpike(): Promise<PersistentSpikeResult> {
@@ -243,12 +251,24 @@ export async function runPersistentSpike(): Promise<PersistentSpikeResult> {
   const bobToAliceEnvelope = await bobSession.encrypt("alice", "hi back");
   const aliceDecrypted = await aliceSession.decrypt("bob", bobToAliceEnvelope);
 
+  // Compute safety numbers for Alice and Bob
+  const aliceSN = await safetyNumberWith(aliceStore, "alice", "bob");
+  const bobSN = await safetyNumberWith(bobStore, "bob", "alice");
+
+  const aliceSafetyNumberFormatted = aliceSN ? formatSafetyNumber(aliceSN) : undefined;
+  const bobSafetyNumberFormatted = bobSN ? formatSafetyNumber(bobSN) : undefined;
+  const match =
+    aliceSN && bobSN ? safetyNumbersMatch(aliceSN.digits, bobSN.digits) : false;
+
   return {
     library,
     aliceDecrypted,
     bobDecrypted,
     aliceToBobEnvelopeType: aliceToBobEnvelope.type,
     bobToAliceEnvelopeType: bobToAliceEnvelope.type,
+    aliceSafetyNumberFormatted,
+    bobSafetyNumberFormatted,
+    safetyNumbersMatch: match,
   };
 }
 

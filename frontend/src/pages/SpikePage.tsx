@@ -103,6 +103,55 @@ export function SpikePage() {
           <p>
             <strong>Alice received:</strong> <code>{persistentResult.aliceDecrypted}</code> (Envelope type: {persistentResult.bobToAliceEnvelopeType})
           </p>
+          {persistentResult.aliceSafetyNumberFormatted && persistentResult.bobSafetyNumberFormatted && (
+            <div style={{ marginTop: "1rem" }} data-testid="safety-number-result">
+              <h4>Safety Number Verification</h4>
+              <p>
+                <strong>Alice's safety number with Bob:</strong>
+              </p>
+              <pre
+                data-testid="alice-safety-number"
+                style={{
+                  background: "#1e1e1e",
+                  color: "#e0e0e0",
+                  padding: "0.75rem",
+                  borderRadius: "6px",
+                  fontFamily: "monospace",
+                  whiteSpace: "pre",
+                }}
+              >
+                {persistentResult.aliceSafetyNumberFormatted}
+              </pre>
+              <p>
+                <strong>Bob's safety number with Alice:</strong>
+              </p>
+              <pre
+                data-testid="bob-safety-number"
+                style={{
+                  background: "#1e1e1e",
+                  color: "#e0e0e0",
+                  padding: "0.75rem",
+                  borderRadius: "6px",
+                  fontFamily: "monospace",
+                  whiteSpace: "pre",
+                }}
+              >
+                {persistentResult.bobSafetyNumberFormatted}
+              </pre>
+              <p>
+                <strong>Verification status:</strong>{" "}
+                <span
+                  data-testid="safety-number-status"
+                  style={{
+                    fontWeight: 700,
+                    color: persistentResult.safetyNumbersMatch ? "#4caf50" : "#f44336",
+                  }}
+                >
+                  {persistentResult.safetyNumbersMatch ? "match" : "MISMATCH"}
+                </span>
+              </p>
+            </div>
+          )}
         </div>
       )}
 

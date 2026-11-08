@@ -15,5 +15,9 @@ describe("Signal protocol spike", () => {
     expect(result.aliceDecrypted).toBe("hi back");
     expect(result.aliceToBobEnvelopeType).toBe(3);
     expect(result.bobToAliceEnvelopeType).toBe(1);
+    expect(result.aliceSafetyNumberFormatted).toBeDefined();
+    expect(result.bobSafetyNumberFormatted).toBeDefined();
+    expect(result.aliceSafetyNumberFormatted).toBe(result.bobSafetyNumberFormatted);
+    expect(result.safetyNumbersMatch).toBe(true);
   });
 });
