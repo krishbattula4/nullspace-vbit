@@ -9,6 +9,10 @@ import {
   type SessionRecordType,
   type StorageType,
 } from "@privacyresearch/libsignal-protocol-typescript";
+import { IndexedDBSignalStore } from "./IndexedDBSignalStore";
+import { provisionKeys } from "./provision";
+import { InMemoryBundleProvider } from "./bundleProvider";
+import { SessionManager } from "./session";
 
 export interface SignalStoreWithIdentity extends StorageType {
   setIdentityKeyPair(keyPair: KeyPairType): Promise<void>;
@@ -204,3 +208,47 @@ export async function runSpike(
     decrypted,
   };
 }
+
+export interface PersistentSpikeResult {
+  library: string;
+  aliceDecrypted: string;
+  bobDecrypted: string;
+  aliceToBobEnvelopeType: 1 | 3;
+  bobToAliceEnvelopeType: 1 | 3;
+}
+
+export async function runPersistentSpike(): Promise<PersistentSpikeResult> {
+  const library = "@privacyresearch/libsignal-protocol-typescript";
+
+  const aliceStore = new IndexedDBSignalStore("alice");
+  const bobStore = new IndexedDBSignalStore("bob");
+  await aliceStore.wipe();
+  await bobStore.wipe();
+
+  const aliceProvision = await provisionKeys("alice", aliceStore);
+  const bobProvision = await provisionKeys("bob", bobStore);
+
+  const bundles = new InMemoryBundleProvider();
+  bundles.register(aliceProvision.bundle);
+  bundles.register(bobProvision.bundle);
+
+  const aliceSession = new SessionManager("alice", aliceStore, bundles);
+  const bobSession = new SessionManager("bob", bobStore, bundles);
+
+  // Alice sends "hello" to Bob (initial message: X3DH handshake, envelope type 3)
+  const aliceToBobEnvelope = await aliceSession.encrypt("bob", "hello");
+  const bobDecrypted = await bobSession.decrypt("alice", aliceToBobEnvelope);
+
+  // Bob sends "hi back" to Alice (reply on established session, envelope type 1)
+  const bobToAliceEnvelope = await bobSession.encrypt("alice", "hi back");
+  const aliceDecrypted = await aliceSession.decrypt("bob", bobToAliceEnvelope);
+
+  return {
+    library,
+    aliceDecrypted,
+    bobDecrypted,
+    aliceToBobEnvelopeType: aliceToBobEnvelope.type,
+    bobToAliceEnvelopeType: bobToAliceEnvelope.type,
+  };
+}
+
