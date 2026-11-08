@@ -20,7 +20,7 @@
 
 import { openDB, deleteDB, type DBSchema, type IDBPDatabase } from "idb";
 import { areArrayBuffersEqual } from "./IndexedDBSignalStore";
-import type { SessionManager } from "./session";
+import type { KeyChangeEvent, SessionManager } from "./session";
 
 export type VerificationState = "UNVERIFIED" | "VERIFIED" | "KEY_CHANGED";
 
@@ -153,7 +153,6 @@ export class VerificationStore {
       verifiedAt: new Date().toISOString(),
     };
     // From KEY_CHANGED -> VERIFIED means user re-verified the new key: clear previousIdentityKey and changedAt
-    // (Notice that previousIdentityKey and changedAt are intentionally omitted from record)
 
     await tx.store.put(record);
     await tx.done;
@@ -236,11 +235,34 @@ export function stateLabel(state: VerificationState): {
   }
 }
 
+export interface AttachVerificationOptions {
+  onKeyChanged?: (event: KeyChangeEvent, record: TrustRecord) => void;
+}
+
 export function attachVerification(
   sessionManager: SessionManager,
   verificationStore: VerificationStore,
+  options?: AttachVerificationOptions,
 ): () => void {
-  return sessionManager.addOnIdentityListener(async (peerId: string, identityKey: ArrayBuffer) => {
-    await verificationStore.observeIdentity(peerId, identityKey);
-  });
+  const unsubIdentity = sessionManager.addOnIdentityListener(
+    async (peerId: string, identityKey: ArrayBuffer) => {
+      await verificationStore.observeIdentity(peerId, identityKey);
+    },
+  );
+
+  const unsubKeyChanged = sessionManager.addOnKeyChangedListener(
+    async (event: KeyChangeEvent) => {
+      if (options?.onKeyChanged) {
+        const record = await verificationStore.get(event.peerId);
+        if (record) {
+          options.onKeyChanged(event, record);
+        }
+      }
+    },
+  );
+
+  return () => {
+    unsubIdentity();
+    unsubKeyChanged();
+  };
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { runSpike, runPersistentSpike } from "./spike";
+import { runSpike, runPersistentSpike, runKeyChangeSpike } from "./spike";
 
 describe("Signal protocol spike", () => {
   it("resolves with decrypted === 'hello'", async () => {
@@ -19,5 +19,16 @@ describe("Signal protocol spike", () => {
     expect(result.bobSafetyNumberFormatted).toBeDefined();
     expect(result.aliceSafetyNumberFormatted).toBe(result.bobSafetyNumberFormatted);
     expect(result.safetyNumbersMatch).toBe(true);
+  });
+
+  it("runKeyChangeSpike simulates Bob key change, alice decrypts, verification becomes Key changed", async () => {
+    const result = await runKeyChangeSpike();
+    expect(result.library).toBe("@privacyresearch/libsignal-protocol-typescript");
+    expect(result.decryptedSuccess).toBe(true);
+    expect(result.aliceDecrypted).toBe("I reinstalled");
+    expect(result.stateLabelText).toBe("Key changed");
+    expect(result.stateLabelColour).toBe("red");
+    expect(result.eventDirection).toBe("incoming");
+    expect(result.safetyNumbersDiffer).toBe(true);
   });
 });
