@@ -12,7 +12,8 @@ import {
 import { IndexedDBSignalStore } from "./IndexedDBSignalStore";
 import { provisionKeys } from "./provision";
 import { InMemoryBundleProvider } from "./bundleProvider";
-import { SessionManager } from "./session";
+import { SessionManager, type KeyChangeEvent } from "./session";
+import { VerificationStore, stateLabel, attachVerification } from "./verification";
 import {
   safetyNumberWith,
   formatSafetyNumber,
@@ -269,6 +270,95 @@ export async function runPersistentSpike(): Promise<PersistentSpikeResult> {
     aliceSafetyNumberFormatted,
     bobSafetyNumberFormatted,
     safetyNumbersMatch: match,
+  };
+}
+
+export interface KeyChangeSpikeResult {
+  library: string;
+  aliceDecrypted: string;
+  decryptedSuccess: boolean;
+  stateLabelText: "Unverified" | "Verified" | "Key changed";
+  stateLabelColour: "amber" | "green" | "red";
+  eventDirection?: "incoming" | "outgoing";
+  safetyNumberBeforeFormatted?: string;
+  safetyNumberAfterFormatted?: string;
+  safetyNumbersDiffer: boolean;
+}
+
+export async function runKeyChangeSpike(): Promise<KeyChangeSpikeResult> {
+  const library = "@privacyresearch/libsignal-protocol-typescript";
+
+  const aliceStore = new IndexedDBSignalStore("alice");
+  const bobStore1 = new IndexedDBSignalStore("bob");
+  await aliceStore.wipe();
+  await bobStore1.wipe();
+
+  const aliceTrust = new VerificationStore("alice");
+  await aliceTrust.wipe();
+
+  const aliceProvision = await provisionKeys("alice", aliceStore);
+  const bobProvision1 = await provisionKeys("bob", bobStore1);
+
+  const bundles = new InMemoryBundleProvider();
+  bundles.register(aliceProvision.bundle);
+  bundles.register(bobProvision1.bundle);
+
+  let lastKeyChangeEvent: KeyChangeEvent | undefined;
+
+  const aliceSession = new SessionManager("alice", aliceStore, bundles);
+  const bobSession1 = new SessionManager("bob", bobStore1, bundles);
+
+  attachVerification(aliceSession, aliceTrust, {
+    onKeyChanged: (event) => {
+      lastKeyChangeEvent = event;
+    },
+  });
+
+  // Initial message exchange so session and trusted keys are established
+  const initialEnvelope = await aliceSession.encrypt("bob", "initial handshake");
+  await bobSession1.decrypt("alice", initialEnvelope);
+
+  // Safety number before key change
+  const snBefore = await safetyNumberWith(aliceStore, "alice", "bob");
+  const safetyNumberBeforeFormatted = snBefore ? formatSafetyNumber(snBefore) : undefined;
+
+  // Re-provision Bob with a fresh IndexedDBSignalStore (wipe first)
+  const bobStore2 = new IndexedDBSignalStore("bob");
+  await bobStore2.wipe();
+  const bobProvision2 = await provisionKeys("bob", bobStore2);
+
+  // Re-register Bob's new bundle in the provider
+  bundles.register(bobProvision2.bundle);
+
+  // NEW Bob sends "I reinstalled" to Alice
+  const bobSession2 = new SessionManager("bob", bobStore2, bundles);
+  const reinstalledEnvelope = await bobSession2.encrypt("alice", "I reinstalled");
+
+  // Alice decrypts it
+  const aliceDecrypted = await aliceSession.decrypt("bob", reinstalledEnvelope);
+  const decryptedSuccess = aliceDecrypted === "I reinstalled";
+
+  // Alice's verification state for Bob
+  const record = await aliceTrust.get("bob");
+  const label = stateLabel(record?.state ?? "UNVERIFIED");
+
+  // Safety number after key change
+  const snAfter = await safetyNumberWith(aliceStore, "alice", "bob");
+  const safetyNumberAfterFormatted = snAfter ? formatSafetyNumber(snAfter) : undefined;
+  const safetyNumbersDiffer = Boolean(
+    snBefore && snAfter && snBefore.digits !== snAfter.digits,
+  );
+
+  return {
+    library,
+    aliceDecrypted,
+    decryptedSuccess,
+    stateLabelText: label.text,
+    stateLabelColour: label.colour,
+    eventDirection: lastKeyChangeEvent?.direction,
+    safetyNumberBeforeFormatted,
+    safetyNumberAfterFormatted,
+    safetyNumbersDiffer,
   };
 }
 

@@ -8,6 +8,7 @@ import {
 import type { IndexedDBSignalStore } from "./IndexedDBSignalStore";
 import type { BundleProvider } from "./bundleProvider";
 import { fromBase64, toBase64 } from "./bundle";
+import { extractIdentityKeyFromPreKeyMessage } from "./prekeyMessage";
 
 export class IdentityChangedError extends Error {
   constructor(public peerId: string) {
@@ -23,8 +24,19 @@ export type CipherEnvelope = {
 
 export type IdentityCallback = (peerId: string, identityKey: ArrayBuffer) => Promise<void> | void;
 
+export type KeyChangeEvent = {
+  peerId: string;
+  direction: "incoming" | "outgoing";
+  previousKey?: ArrayBuffer;
+  newKey: ArrayBuffer;
+  at: string;
+};
+
+export type KeyChangeCallback = (event: KeyChangeEvent) => Promise<void> | void;
+
 export interface SessionManagerOptions {
   onIdentity?: IdentityCallback;
+  onKeyChanged?: KeyChangeCallback;
 }
 
 function isIdentityFailure(err: unknown): boolean {
@@ -58,6 +70,7 @@ function base64ToBinaryString(b64: string): string {
 
 export class SessionManager {
   private identityListeners = new Set<IdentityCallback>();
+  private keyChangeListeners = new Set<KeyChangeCallback>();
 
   constructor(
     private userId: string,
@@ -69,6 +82,9 @@ export class SessionManager {
     if (options?.onIdentity) {
       this.identityListeners.add(options.onIdentity);
     }
+    if (options?.onKeyChanged) {
+      this.keyChangeListeners.add(options.onKeyChanged);
+    }
   }
 
   addOnIdentityListener(listener: IdentityCallback): () => void {
@@ -78,9 +94,22 @@ export class SessionManager {
     };
   }
 
+  addOnKeyChangedListener(listener: KeyChangeCallback): () => void {
+    this.keyChangeListeners.add(listener);
+    return () => {
+      this.keyChangeListeners.delete(listener);
+    };
+  }
+
   private async notifyIdentity(peerId: string, identityKey: ArrayBuffer): Promise<void> {
     for (const listener of this.identityListeners) {
       await listener(peerId, identityKey);
+    }
+  }
+
+  private async notifyKeyChanged(event: KeyChangeEvent): Promise<void> {
+    for (const listener of this.keyChangeListeners) {
+      await listener(event);
     }
   }
 
@@ -125,15 +154,40 @@ export class SessionManager {
       await this.notifyIdentity(peerId, device.identityKey);
     } catch (err) {
       if (isIdentityFailure(err)) {
+        const address = this.address(peerId).toString();
+        const previousKey = await this.store.loadIdentityKey(address);
         try {
           await this.notifyIdentity(peerId, device.identityKey);
         } catch {
           // Do not mask IdentityChangedError if notification hook encounters an issue
         }
+        await this.notifyKeyChanged({
+          peerId,
+          direction: "outgoing",
+          previousKey,
+          newKey: device.identityKey,
+          at: new Date().toISOString(),
+        });
         throw new IdentityChangedError(peerId);
       }
       throw err;
     }
+  }
+
+  async acceptNewIdentity(peerId: string): Promise<void> {
+    const bundle = await this.bundles.fetchBundle(peerId);
+    const newKey = fromBase64(bundle.identityKey);
+    const address = this.address(peerId).toString();
+
+    // Saves its identity key into the Signal store for the address
+    await this.store.saveIdentity(address, newKey);
+
+    // Removes any existing session for the peer so the next encrypt re-runs X3DH
+    await this.store.removeAllSessions(peerId);
+    await this.store.removeSession(address);
+
+    // Notifies listeners with the key (VerificationStore will see the same key it already recorded, so state stays KEY_CHANGED)
+    await this.notifyIdentity(peerId, newKey);
   }
 
   async encrypt(peerId: string, plaintext: string): Promise<CipherEnvelope> {
@@ -175,13 +229,27 @@ export class SessionManager {
     let decryptedBuffer: ArrayBuffer;
     try {
       if (envelope.type === 3) {
-        decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binary, "binary");
-        let remoteIdentityKey = await this.store.loadIdentityKey(`${peerId}.1`);
-        if (!remoteIdentityKey) {
-          remoteIdentityKey = await this.store.loadIdentityKey(peerId);
+        const incomingKey = extractIdentityKeyFromPreKeyMessage(binary);
+        const address = this.address(peerId).toString();
+        const previousKey = await this.store.loadIdentityKey(address);
+        const changed = await this.store.identityChanged(address, incomingKey);
+
+        if (changed) {
+          await this.notifyIdentity(peerId, incomingKey); // VerificationStore records KEY_CHANGED
+          await this.store.saveIdentity(address, incomingKey); // accept so decryption can proceed
+          await this.notifyKeyChanged({
+            peerId,
+            direction: "incoming",
+            previousKey,
+            newKey: incomingKey,
+            at: new Date().toISOString(),
+          });
         }
-        if (remoteIdentityKey) {
-          await this.notifyIdentity(peerId, remoteIdentityKey);
+
+        decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binary, "binary");
+
+        if (!changed && !previousKey) {
+          await this.notifyIdentity(peerId, incomingKey);
         }
       } else if (envelope.type === 1) {
         decryptedBuffer = await cipher.decryptWhisperMessage(binary, "binary");

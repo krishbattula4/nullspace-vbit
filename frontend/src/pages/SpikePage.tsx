@@ -1,5 +1,11 @@
 import { useState } from "react";
-import { runSpike, runPersistentSpike, type PersistentSpikeResult } from "../crypto/spike";
+import {
+  runSpike,
+  runPersistentSpike,
+  runKeyChangeSpike,
+  type PersistentSpikeResult,
+  type KeyChangeSpikeResult,
+} from "../crypto/spike";
 
 export function SpikePage() {
   const [isRunning, setIsRunning] = useState(false);
@@ -9,6 +15,10 @@ export function SpikePage() {
   const [isPersistentRunning, setIsPersistentRunning] = useState(false);
   const [persistentResult, setPersistentResult] = useState<PersistentSpikeResult | null>(null);
   const [persistentError, setPersistentError] = useState<string | null>(null);
+
+  const [isKeyChangeRunning, setIsKeyChangeRunning] = useState(false);
+  const [keyChangeResult, setKeyChangeResult] = useState<KeyChangeSpikeResult | null>(null);
+  const [keyChangeError, setKeyChangeError] = useState<string | null>(null);
 
   const handleRunSpike = async () => {
     setIsRunning(true);
@@ -35,6 +45,20 @@ export function SpikePage() {
       setPersistentResult(null);
     } finally {
       setIsPersistentRunning(false);
+    }
+  };
+
+  const handleRunKeyChangeSpike = async () => {
+    setIsKeyChangeRunning(true);
+    setKeyChangeError(null);
+    try {
+      const res = await runKeyChangeSpike();
+      setKeyChangeResult(res);
+    } catch (err) {
+      setKeyChangeError(err instanceof Error ? err.message : String(err));
+      setKeyChangeResult(null);
+    } finally {
+      setIsKeyChangeRunning(false);
     }
   };
 
@@ -68,6 +92,19 @@ export function SpikePage() {
           }}
         >
           {isPersistentRunning ? "Running..." : "Run persistent spike"}
+        </button>
+
+        <button
+          type="button"
+          onClick={handleRunKeyChangeSpike}
+          disabled={isKeyChangeRunning}
+          style={{
+            padding: "0.5rem 1rem",
+            cursor: isKeyChangeRunning ? "not-allowed" : "pointer",
+            fontWeight: 600,
+          }}
+        >
+          {isKeyChangeRunning ? "Running..." : "Simulate key change on Bob"}
         </button>
       </div>
 
@@ -159,6 +196,102 @@ export function SpikePage() {
         <div style={{ marginTop: "1rem", color: "var(--red)" }} data-testid="persistent-spike-error">
           <p>
             <strong>Persistent Error:</strong> {persistentError}
+          </p>
+        </div>
+      )}
+
+      {keyChangeResult && (
+        <div style={{ marginTop: "1rem" }} data-testid="key-change-spike-result">
+          <h3>Key Change Simulation Result</h3>
+          <p>
+            <strong>Alice decrypted message:</strong>{" "}
+            <span
+              data-testid="key-change-decrypted-status"
+              style={{
+                fontWeight: 700,
+                color: keyChangeResult.decryptedSuccess ? "#4caf50" : "#f44336",
+              }}
+            >
+              {keyChangeResult.decryptedSuccess ? `Yes ("${keyChangeResult.aliceDecrypted}")` : "No"}
+            </span>
+          </p>
+          <p>
+            <strong>Alice's verification state for Bob:</strong>{" "}
+            <span
+              data-testid="key-change-verification-state"
+              style={{
+                fontWeight: 700,
+                color:
+                  keyChangeResult.stateLabelColour === "red"
+                    ? "#f44336"
+                    : keyChangeResult.stateLabelColour === "green"
+                    ? "#4caf50"
+                    : "#ff9800",
+              }}
+            >
+              {keyChangeResult.stateLabelText}
+            </span>
+          </p>
+          <p>
+            <strong>KeyChangeEvent direction:</strong>{" "}
+            <code data-testid="key-change-event-direction">{keyChangeResult.eventDirection}</code>
+          </p>
+          {keyChangeResult.safetyNumberBeforeFormatted && keyChangeResult.safetyNumberAfterFormatted && (
+            <div style={{ marginTop: "1rem" }}>
+              <h4>Safety Number Comparison</h4>
+              <p>
+                <strong>Safety number before key change:</strong>
+              </p>
+              <pre
+                data-testid="safety-number-before"
+                style={{
+                  background: "#1e1e1e",
+                  color: "#e0e0e0",
+                  padding: "0.75rem",
+                  borderRadius: "6px",
+                  fontFamily: "monospace",
+                  whiteSpace: "pre",
+                }}
+              >
+                {keyChangeResult.safetyNumberBeforeFormatted}
+              </pre>
+              <p>
+                <strong>Safety number after key change:</strong>
+              </p>
+              <pre
+                data-testid="safety-number-after"
+                style={{
+                  background: "#1e1e1e",
+                  color: "#e0e0e0",
+                  padding: "0.75rem",
+                  borderRadius: "6px",
+                  fontFamily: "monospace",
+                  whiteSpace: "pre",
+                }}
+              >
+                {keyChangeResult.safetyNumberAfterFormatted}
+              </pre>
+              <p>
+                <strong>Safety numbers differ:</strong>{" "}
+                <span
+                  data-testid="safety-numbers-differ-status"
+                  style={{
+                    fontWeight: 700,
+                    color: keyChangeResult.safetyNumbersDiffer ? "#4caf50" : "#f44336",
+                  }}
+                >
+                  {keyChangeResult.safetyNumbersDiffer ? "Yes (differ)" : "No (identical)"}
+                </span>
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {keyChangeError && (
+        <div style={{ marginTop: "1rem", color: "var(--red)" }} data-testid="key-change-spike-error">
+          <p>
+            <strong>Key Change Error:</strong> {keyChangeError}
           </p>
         </div>
       )}
