@@ -21,6 +21,12 @@ export type CipherEnvelope = {
   body: string;
 };
 
+export type IdentityCallback = (peerId: string, identityKey: ArrayBuffer) => Promise<void> | void;
+
+export interface SessionManagerOptions {
+  onIdentity?: IdentityCallback;
+}
+
 function isIdentityFailure(err: unknown): boolean {
   if (err instanceof IdentityChangedError) {
     return true;
@@ -51,12 +57,31 @@ function base64ToBinaryString(b64: string): string {
 }
 
 export class SessionManager {
+  private identityListeners = new Set<IdentityCallback>();
+
   constructor(
     private userId: string,
     private store: IndexedDBSignalStore,
     private bundles: BundleProvider,
+    options?: SessionManagerOptions,
   ) {
     void this.userId;
+    if (options?.onIdentity) {
+      this.identityListeners.add(options.onIdentity);
+    }
+  }
+
+  addOnIdentityListener(listener: IdentityCallback): () => void {
+    this.identityListeners.add(listener);
+    return () => {
+      this.identityListeners.delete(listener);
+    };
+  }
+
+  private async notifyIdentity(peerId: string, identityKey: ArrayBuffer): Promise<void> {
+    for (const listener of this.identityListeners) {
+      await listener(peerId, identityKey);
+    }
   }
 
   address(peerId: string): SignalProtocolAddress {
@@ -97,8 +122,14 @@ export class SessionManager {
     const sessionBuilder = new SessionBuilder(this.store, this.address(peerId));
     try {
       await sessionBuilder.processPreKey(device);
+      await this.notifyIdentity(peerId, device.identityKey);
     } catch (err) {
       if (isIdentityFailure(err)) {
+        try {
+          await this.notifyIdentity(peerId, device.identityKey);
+        } catch {
+          // Do not mask IdentityChangedError if notification hook encounters an issue
+        }
         throw new IdentityChangedError(peerId);
       }
       throw err;
@@ -145,6 +176,13 @@ export class SessionManager {
     try {
       if (envelope.type === 3) {
         decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binary, "binary");
+        let remoteIdentityKey = await this.store.loadIdentityKey(`${peerId}.1`);
+        if (!remoteIdentityKey) {
+          remoteIdentityKey = await this.store.loadIdentityKey(peerId);
+        }
+        if (remoteIdentityKey) {
+          await this.notifyIdentity(peerId, remoteIdentityKey);
+        }
       } else if (envelope.type === 1) {
         decryptedBuffer = await cipher.decryptWhisperMessage(binary, "binary");
       } else {

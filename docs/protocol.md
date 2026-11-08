@@ -100,5 +100,33 @@ Safety numbers provide out-of-band visible key verification between two users to
 - **Symmetry**: Identical on both devices when neither identity key has been substituted. `FingerprintGenerator.createFor` lexicographically sorts the two 30-digit halves before concatenating, ensuring identical digits regardless of which user is local or remote.
 - **Security & Privacy**: The safety number never leaves the client device over the wire. It is never sent to the server. Verification is conducted strictly out-of-band (in person, over a secure voice call, or by scanning a QR code in task P4.2).
 
+## Verification states
 
+Nullspace tracks each peer contact's verification status locally on the device using a per-user IndexedDB trust store (`nullspace-trust-${userId}`, object store `trust` keyed by `peerId`).
 
+### State table
+
+| From State | Event | To State | Notes |
+|---|---|---|---|
+| (none) | `recordFirstUse(k1)` | `UNVERIFIED` | Trust On First Use (TOFU). Stores initial `identityKey = k1`. |
+| (none) | `observeIdentity(k1)` | `UNVERIFIED` | Same as `recordFirstUse`; `changed = false`. |
+| `UNVERIFIED` | `observeIdentity(k1)` | `UNVERIFIED` | Matching identity key byte-for-byte; `changed = false`. |
+| `UNVERIFIED` | `markVerified` | `VERIFIED` | User explicitly verified safety number; sets `verifiedAt` timestamp. |
+| `UNVERIFIED` | `observeIdentity(k2)` | `KEY_CHANGED` | Key mismatch: `previousIdentityKey = k1`, `identityKey = k2`, `changedAt = now`, `changed = true`. |
+| `VERIFIED` | `observeIdentity(k1)` | `VERIFIED` | Matching identity key byte-for-byte; `changed = false`. |
+| `VERIFIED` | `markVerified` | `VERIFIED` | Re-verifying updates `verifiedAt` timestamp. |
+| `VERIFIED` | `observeIdentity(k2)` | `KEY_CHANGED` | Key mismatch: `previousIdentityKey = k1`, `identityKey = k2`, `changedAt = now`, `changed = true`. |
+| `KEY_CHANGED` | `observeIdentity(k2)` | `KEY_CHANGED` | Matching the currently changed key; `changed = false`. |
+| `KEY_CHANGED` | `observeIdentity(k3)` | `KEY_CHANGED` | Key changed again: `previousIdentityKey = k2`, `identityKey = k3`, `changedAt = now`, `changed = true`. |
+| `KEY_CHANGED` | `markVerified` | `VERIFIED` | User re-verified the new key: clears `previousIdentityKey` and `changedAt`, sets `verifiedAt`. |
+| any | `reset(peerId)` | (none) | Removes peer trust record from local store (used on reset/logout). |
+| any | `wipe()` | (none) | Wipes entire trust database for user. |
+
+### Key change security rule
+
+**A key change always produces `KEY_CHANGED` and a visible warning, never a silent overwrite.**
+
+When a remote peer's identity key differs from the stored trusted key:
+1. The cryptographic session establishment is rejected by libsignal (`IdentityChangedError`).
+2. The verification store records `previousIdentityKey = oldKey`, `identityKey = newKey`, and sets the contact's state to `KEY_CHANGED` with a `changedAt` timestamp.
+3. The UI (P4.6) renders a red `Key changed` indicator and alerts the user to verify the updated safety number out-of-band before resuming encrypted communication.
