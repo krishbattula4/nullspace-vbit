@@ -1,7 +1,8 @@
 """Application settings. Every value comes from the environment (see .env.example)."""
 from functools import lru_cache
+from typing import Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +27,16 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173"
     media_dir: str = "./media"
     max_message_bytes: int = 65536
+
+    @model_validator(mode="after")
+    def validate_jwt_secret(self) -> Self:
+        if self.app_env not in ("development", "test"):
+            if len(self.jwt_secret) < 32 or self.jwt_secret == "change-me":
+                raise ValueError(
+                    "jwt_secret must be at least 32 characters and not 'change-me' "
+                    f"in non-development environment '{self.app_env}'"
+                )
+        return self
 
     @property
     def sqlalchemy_url(self) -> str:
