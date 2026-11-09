@@ -10,6 +10,7 @@ import app.api.ws as ws_module
 from app.core.tokens import create_access_token
 from app.main import app
 from app.ws.registry import registry
+from tests.helpers import wait_until
 
 
 def _create_user_and_tokens(
@@ -49,8 +50,13 @@ def test_valid_auth_frame_registers_and_unregisters() -> None:
             assert uuid.UUID(user_id) in registry.connected_user_ids()
 
         # After closing the socket, registry must be empty
-        assert len(registry.get(user_id)) == 0
-        assert registry.count() == 0
+        assert wait_until(lambda: len(registry.get(user_id)) == 0), (
+            f"Expected user {user_id} sockets to be 0, "
+            f"got {len(registry.get(user_id))} (total: {registry.count()})"
+        )
+        assert wait_until(lambda: registry.count() == 0), (
+            f"Expected registry count to be 0, got {registry.count()}"
+        )
 
 
 def test_two_sockets_for_same_user_are_both_registered() -> None:
@@ -72,12 +78,22 @@ def test_two_sockets_for_same_user_are_both_registered() -> None:
                 assert registry.count() == 2
 
             # Socket 2 closed; socket 1 still active
-            assert len(registry.get(user_id)) == 1
-            assert registry.count() == 1
+            assert wait_until(lambda: len(registry.get(user_id)) == 1), (
+                f"Expected user {user_id} sockets to be 1, "
+                f"got {len(registry.get(user_id))} (total: {registry.count()})"
+            )
+            assert wait_until(lambda: registry.count() == 1), (
+                f"Expected registry count to be 1, got {registry.count()}"
+            )
 
         # Both sockets closed
-        assert len(registry.get(user_id)) == 0
-        assert registry.count() == 0
+        assert wait_until(lambda: len(registry.get(user_id)) == 0), (
+            f"Expected user {user_id} sockets to be 0, "
+            f"got {len(registry.get(user_id))} (total: {registry.count()})"
+        )
+        assert wait_until(lambda: registry.count() == 0), (
+            f"Expected registry count to be 0, got {registry.count()}"
+        )
 
 
 def test_no_frame_within_timeout_closes_with_4401(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -91,7 +107,9 @@ def test_no_frame_within_timeout_closes_with_4401(monkeypatch: pytest.MonkeyPatc
 
         assert exc_info.value.code == 4401
         assert exc_info.value.reason == "auth_timeout"
-        assert registry.count() == 0
+        assert wait_until(lambda: registry.count() == 0), (
+            f"Expected registry count to be 0, got {registry.count()}"
+        )
 
 
 @pytest.mark.parametrize(
@@ -141,8 +159,13 @@ def test_invalid_frames_close_with_4401_and_leave_registry_empty(
 
         assert exc_info.value.code == expected_code
         assert exc_info.value.reason == expected_reason
-        assert registry.count() == 0
-        assert len(registry.get(user_id)) == 0
+        assert wait_until(lambda: registry.count() == 0), (
+            f"Expected registry count to be 0, got {registry.count()}"
+        )
+        assert wait_until(lambda: len(registry.get(user_id)) == 0), (
+            f"Expected user {user_id} sockets to be 0, "
+            f"got {len(registry.get(user_id))} (total: {registry.count()})"
+        )
 
 
 def test_url_query_token_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -159,5 +182,10 @@ def test_url_query_token_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
 
         assert exc_info.value.code == 4401
         assert exc_info.value.reason == "auth_timeout"
-        assert registry.count() == 0
-        assert len(registry.get(user_id)) == 0
+        assert wait_until(lambda: registry.count() == 0), (
+            f"Expected registry count to be 0, got {registry.count()}"
+        )
+        assert wait_until(lambda: len(registry.get(user_id)) == 0), (
+            f"Expected user {user_id} sockets to be 0, "
+            f"got {len(registry.get(user_id))} (total: {registry.count()})"
+        )
