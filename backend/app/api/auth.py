@@ -20,6 +20,7 @@ from app.api.schemas import (
 )
 from app.core.config import get_settings
 from app.core.db import get_db
+from app.core.deps import get_current_user
 from app.core.security import hash_password, hash_password_async, verify_password_async
 from app.core.tokens import (
     TokenExpired,
@@ -84,6 +85,18 @@ async def register(
 
     log.info("user registered: user_id=%s", user.user_id)
     return user
+
+
+@router.get(
+    "/me",
+    status_code=status.HTTP_200_OK,
+    response_model=UserPublic,
+)
+async def me(
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> User:
+    """Return the profile of the currently authenticated user."""
+    return current_user
 
 
 @router.post(

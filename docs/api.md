@@ -227,6 +227,47 @@ Returned on successful logout. Idempotent: returns 204 even if the token is alre
 
 ---
 
+### Get Current User Profile
+
+Retrieves the public profile of the currently authenticated user.
+
+- **Method**: `GET`
+- **Path**: `/auth/me`
+- **Headers**:
+  - `Authorization: Bearer <access_token>` (Required)
+
+#### Responses
+
+##### 200 OK
+Returned when the access token is valid and the user account exists.
+
+**Response Body**:
+```json
+{
+  "user_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "username": "alice",
+  "display_name": "Alice",
+  "created_at": "2026-11-09T12:00:00Z"
+}
+```
+
+##### 401 Unauthorized
+Returned when authentication fails. Always includes response header `WWW-Authenticate: Bearer`.
+
+Error details:
+- **`not_authenticated`**: The `Authorization` header is missing, malformed, does not use the `Bearer` scheme, or has an empty token value.
+- **`token_expired`**: The presented access token has passed its expiration timestamp (`exp`).
+- **`invalid_token`**: The token is invalid, has an invalid signature, is missing required claims, has an algorithm other than `HS256`, is a refresh token instead of an access token, or the user referenced in `sub` no longer exists.
+
+**Example Response Body**:
+```json
+{
+  "detail": "not_authenticated"
+}
+```
+
+---
+
 ## Security and Privacy Rules
 
 1. **Password Hashing**: Passwords are hashed using standard bcrypt (`$2b$`) with cost factor configured via `BCRYPT_ROUNDS` (defaults to 12).
