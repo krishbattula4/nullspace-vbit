@@ -38,6 +38,46 @@ type CipherEnvelope = {
 
 REST (HTTPS) is used for one-shot operations: `/auth/*`, `/keys/*`, `/conversations/*`, `/media/*`, `/me/audit`.
 
+## WebSocket authentication
+
+WebSocket connections are initiated at endpoint `/ws`.
+
+### Handshake flow
+
+1. **Connection Acceptance**: The server accepts the initial WebSocket connection without prior authentication.
+2. **Authentication Frame**: The client must send a JSON authentication frame as its first message within 5 seconds (`AUTH_TIMEOUT_SECONDS = 5.0`):
+   ```json
+   {
+     "type": "AUTH",
+     "token": "<access token>"
+   }
+   ```
+3. **Validation & Verification**: The server decodes the token enforcing `expected_type="access"` and validates that the user exists in the database. A short-lived database session is used solely for the user lookup and immediately released—no database session is held open for the lifetime of the connection.
+4. **Acknowledgment**: On successful authentication, the server registers the socket in the connection registry (`registry`) and sends an acknowledgment frame:
+   ```json
+   {
+     "type": "AUTH_OK",
+     "user_id": "<user_uuid>"
+   }
+   ```
+5. **Connection Lifecycle**: The client may maintain multiple active sockets (e.g. across multiple browser tabs). Sockets remain registered until closed or disconnected, at which point they are automatically unregistered from the connection registry in a `finally` block.
+
+### Close codes
+
+If authentication fails, the server closes the WebSocket connection with code `4401` and a short reason string:
+
+| Close Code | Reason String | Condition |
+|---|---|---|
+| `4401` | `"auth_timeout"` | No frame was received within `AUTH_TIMEOUT_SECONDS` (5 seconds). |
+| `4401` | `"token_expired"` | The presented access JWT has expired. |
+| `4401` | `"invalid_token"` | Non-JSON payload, frame `type` is not `"AUTH"`, missing or empty `token`, malformed JWT, signature error, refresh token presented instead of access token, or user no longer exists in the database. |
+
+### Zero-token URL query policy
+
+**Authentication tokens are never accepted in the URL query string** (such as `/ws?token=...`).
+
+**Rationale**: URLs and query strings are routinely recorded in plain text across web server access logs, reverse proxy logs, application performance traces, error monitoring dashboards, and browser navigation histories. Placing sensitive Bearer tokens in URLs causes credentials to leak across logging infrastructure. Nullspace strictly ignores query parameter tokens and mandates that authentication occurs over the established WebSocket channel via the encrypted TLS tunnel.
+
 ## Client key storage
 
 The client persists Signal Protocol state locally using browser IndexedDB via `IndexedDBSignalStore`. Each user account uses an isolated database named:
