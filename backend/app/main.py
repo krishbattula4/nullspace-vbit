@@ -5,11 +5,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import health
+from app.api import auth, health
 from app.core.config import get_settings
 from app.core.db import dispose_engine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("aiosqlite").setLevel(logging.WARNING)
 log = logging.getLogger("nullspace")
 
 
@@ -41,7 +42,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(health.router)
-    # P1: app.include_router(auth.router, prefix="/auth")
+    app.include_router(auth.router)
     # P2: websocket endpoint at /ws, conversations router
     # P3: keys router
     return app
