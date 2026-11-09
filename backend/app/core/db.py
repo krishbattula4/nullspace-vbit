@@ -1,4 +1,5 @@
 """Async SQLAlchemy engine, session factory and the declarative base used by every model."""
+import logging
 from collections.abc import AsyncIterator
 
 from sqlalchemy import MetaData, event
@@ -39,6 +40,7 @@ def get_engine() -> AsyncEngine:
             kwargs["poolclass"] = NullPool
         _engine = create_async_engine(settings.sqlalchemy_url, **kwargs)
         if _engine.dialect.name == "sqlite":
+            logging.getLogger("aiosqlite").setLevel(logging.WARNING)
 
             @event.listens_for(_engine.sync_engine, "connect")
             def set_sqlite_pragma(dbapi_connection, connection_record):

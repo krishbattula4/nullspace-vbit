@@ -19,6 +19,7 @@ class Settings(BaseSettings):
         default=None, description="Full SQLAlchemy URL; overrides the POSTGRES_* fields when set"
     )
 
+    bcrypt_rounds: int = 12
     jwt_secret: str = "change-me"
     jwt_access_minutes: int = 15
     jwt_refresh_days: int = 7
