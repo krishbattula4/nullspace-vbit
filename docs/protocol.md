@@ -126,7 +126,8 @@ Nullspace tracks each peer contact's verification status locally on the device u
 
 **A key change always produces `KEY_CHANGED` and a visible warning, never a silent overwrite.**
 
-When a remote peer's identity key differs from the stored trusted key:
-1. The cryptographic session establishment is rejected by libsignal (`IdentityChangedError`).
-2. The verification store records `previousIdentityKey = oldKey`, `identityKey = newKey`, and sets the contact's state to `KEY_CHANGED` with a `changedAt` timestamp.
-3. The UI (P4.6) renders a red `Key changed` indicator and alerts the user to verify the updated safety number out-of-band before resuming encrypted communication.
+### Key change policy
+
+- **Incoming prekey message with a new identity key**: record `KEY_CHANGED` in the `VerificationStore`, accept the new key in the Signal store, decrypt and deliver the message. The user sees a red "Key changed" state and an in-chat warning (P4.6); messages are never silently dropped.
+- **Outgoing session setup with a new identity key**: record `KEY_CHANGED`, do NOT send. The caller gets `IdentityChangedError`. The UI offers "Continue with new key", which calls `acceptNewIdentity`; the state stays `KEY_CHANGED` until the user re-verifies.
+
