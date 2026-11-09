@@ -35,11 +35,15 @@ jobs:
         env:
           DATABASE_URL: postgresql+asyncpg://nullspace:nullspace@localhost:5432/nullspace_test
         run: alembic upgrade head
+      - name: Check for model changes without migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://nullspace:nullspace@localhost:5432/nullspace_test
+        run: alembic check
       - name: Tests against PostgreSQL
         env:
           DATABASE_URL: postgresql+asyncpg://nullspace:nullspace@localhost:5432/nullspace_test
           JWT_SECRET: ci-secret
-        run: pytest -q
+        run: pytest -q -rs
 
   frontend:
     runs-on: ubuntu-latest
