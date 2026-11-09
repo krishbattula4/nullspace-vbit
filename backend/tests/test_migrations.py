@@ -27,7 +27,7 @@ def test_migrations_lifecycle(tmp_path: Path) -> None:
     ), f"alembic upgrade head failed:\n{res_up1.stderr}\n{res_up1.stdout}"
 
     # Step 2: Downgrade to base
-    res_down = subprocess.run(
+    res_down_base = subprocess.run(
         [sys.executable, "-m", "alembic", "downgrade", "base"],
         cwd=backend_dir,
         env=env,
@@ -35,8 +35,8 @@ def test_migrations_lifecycle(tmp_path: Path) -> None:
         text=True,
     )
     assert (
-        res_down.returncode == 0
-    ), f"alembic downgrade base failed:\n{res_down.stderr}\n{res_down.stdout}"
+        res_down_base.returncode == 0
+    ), f"alembic downgrade base failed:\n{res_down_base.stderr}\n{res_down_base.stdout}"
 
     # Step 3: Upgrade to head again
     res_up2 = subprocess.run(
@@ -50,28 +50,43 @@ def test_migrations_lifecycle(tmp_path: Path) -> None:
         res_up2.returncode == 0
     ), f"alembic upgrade head (second run) failed:\n{res_up2.stderr}\n{res_up2.stdout}"
 
-    # Step 4: Verify users table exists with sqlite3 module
+    # Step 4: Verify all tables and users columns exist after upgrade head
     conn = sqlite3.connect(db_file)
     try:
         cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users';")
-        row = cur.fetchone()
-        assert row is not None, "Table 'users' was not found in sqlite_master"
-        assert row[0] == "users"
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = {row[0] for row in cur.fetchall()}
 
+        expected_tables = {
+            "users",
+            "refresh_tokens",
+            "conversations",
+            "prekeys",
+            "messages",
+            "message_versions",
+            "media",
+        }
+        assert expected_tables.issubset(
+            tables
+        ), f"Missing tables after upgrade head: {expected_tables - tables}"
+
+        # Verify users columns include identity_key and registration_id
         cur.execute("PRAGMA table_info(users);")
-        columns = {col[1] for col in cur.fetchall()}
-        expected_columns = {"user_id", "username", "password_hash", "display_name", "created_at"}
-        assert expected_columns.issubset(
-            columns
-        ), f"Missing expected columns in users: {expected_columns - columns}"
+        users_columns = {col[1] for col in cur.fetchall()}
+        expected_users_columns = {
+            "user_id",
+            "username",
+            "password_hash",
+            "display_name",
+            "created_at",
+            "identity_key",
+            "registration_id",
+        }
+        assert expected_users_columns.issubset(
+            users_columns
+        ), f"Missing columns in users: {expected_users_columns - users_columns}"
 
-        # Verify refresh_tokens table exists after upgrade to head
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='refresh_tokens';")
-        rt_row = cur.fetchone()
-        assert rt_row is not None, "Table 'refresh_tokens' was not found in sqlite_master"
-        assert rt_row[0] == "refresh_tokens"
-
+        # Verify refresh_tokens columns
         cur.execute("PRAGMA table_info(refresh_tokens);")
         rt_columns = {col[1] for col in cur.fetchall()}
         expected_rt_columns = {
@@ -84,11 +99,11 @@ def test_migrations_lifecycle(tmp_path: Path) -> None:
         }
         assert expected_rt_columns.issubset(
             rt_columns
-        ), f"Missing expected columns in refresh_tokens: {expected_rt_columns - rt_columns}"
+        ), f"Missing columns in refresh_tokens: {expected_rt_columns - rt_columns}"
     finally:
         conn.close()
 
-    # Step 5: Downgrade one revision (-1) to remove refresh_tokens table
+    # Step 5: Downgrade one revision (-1) to remove P1.5 schema additions
     res_down_one = subprocess.run(
         [sys.executable, "-m", "alembic", "downgrade", "-1"],
         cwd=backend_dir,
@@ -100,23 +115,46 @@ def test_migrations_lifecycle(tmp_path: Path) -> None:
         res_down_one.returncode == 0
     ), f"alembic downgrade -1 failed:\n{res_down_one.stderr}\n{res_down_one.stdout}"
 
-    # Step 6: Verify refresh_tokens disappears but users remains
+    # Step 6: Verify P1.5 tables and users columns disappear while users and refresh_tokens remain
     conn = sqlite3.connect(db_file)
     try:
         cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='refresh_tokens';")
-        assert (
-            cur.fetchone() is None
-        ), "Table 'refresh_tokens' should have been removed after downgrade -1"
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables_after_down = {row[0] for row in cur.fetchall()}
 
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users';")
+        p1_5_tables = {"conversations", "prekeys", "messages", "message_versions", "media"}
+        assert p1_5_tables.isdisjoint(
+            tables_after_down
+        ), f"P1.5 tables still exist after downgrade -1: {tables_after_down & p1_5_tables}"
+
+        assert "users" in tables_after_down, "Table 'users' should still exist after downgrade -1"
         assert (
-            cur.fetchone() is not None
-        ), "Table 'users' should still exist after downgrading refresh_tokens revision"
+            "refresh_tokens" in tables_after_down
+        ), "Table 'refresh_tokens' should still exist after downgrade -1"
+
+        # Verify identity_key and registration_id are removed from users
+        cur.execute("PRAGMA table_info(users);")
+        users_columns_after_down = {col[1] for col in cur.fetchall()}
+        p1_5_user_cols = {"identity_key", "registration_id"}
+        assert p1_5_user_cols.isdisjoint(
+            users_columns_after_down
+        ), f"P1.5 columns still exist in users: {users_columns_after_down & p1_5_user_cols}"
     finally:
         conn.close()
 
-    # Step 7: Upgrade to head again and verify refresh_tokens reappears
+    # Step 7: Downgrade to base succeeds from -1
+    res_down_base2 = subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "base"],
+        cwd=backend_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert (
+        res_down_base2.returncode == 0
+    ), f"alembic downgrade base failed:\n{res_down_base2.stderr}\n{res_down_base2.stdout}"
+
+    # Step 8: Upgrade to head again and verify all tables reappear
     res_up3 = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head"],
         cwd=backend_dir,
@@ -131,7 +169,10 @@ def test_migrations_lifecycle(tmp_path: Path) -> None:
     conn = sqlite3.connect(db_file)
     try:
         cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='refresh_tokens';")
-        assert cur.fetchone() is not None, "Table 'refresh_tokens' was not found after re-upgrade"
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables_final = {row[0] for row in cur.fetchall()}
+        assert expected_tables.issubset(
+            tables_final
+        ), f"Missing tables after final upgrade head: {expected_tables - tables_final}"
     finally:
         conn.close()
