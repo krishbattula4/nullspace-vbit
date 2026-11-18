@@ -1,9 +1,15 @@
 """Password hashing and verification using bcrypt."""
 import asyncio
+import re
 
 import bcrypt
 
 from app.core.config import get_settings
+
+# A bcrypt hash is exactly 60 characters: $2b$ + 2-digit cost + $ + 53 chars of salt and digest.
+# Some bcrypt builds panic (a BaseException that "except Exception" does not catch) on a
+# truncated hash, so the format is checked before the library is called.
+_BCRYPT_HASH_RE = re.compile(r"^\$2[abxy]\$\d{2}\$[./A-Za-z0-9]{53}$")
 
 
 def hash_password(plain: str, rounds: int | None = None) -> str:
@@ -29,8 +35,9 @@ def verify_password(plain: str, hashed: str) -> bool:
         plain_bytes = plain.encode("utf-8")
         if len(plain_bytes) > 72:
             return False
-        hashed_bytes = hashed.encode("utf-8")
-        return bcrypt.checkpw(plain_bytes, hashed_bytes)
+        if not _BCRYPT_HASH_RE.match(hashed):
+            return False
+        return bcrypt.checkpw(plain_bytes, hashed.encode("utf-8"))
     except Exception:
         return False
 
