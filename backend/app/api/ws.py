@@ -42,7 +42,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         return
     except WebSocketDisconnect:
         return
-    except Exception:
+    except Exception:  # pragma: no cover - defensive catch for unexpected receive errors
         await websocket.close(code=4401, reason="invalid_token")
         return
 
@@ -100,7 +100,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             await websocket.receive()
     except WebSocketDisconnect:
         pass
-    except Exception:
+    except Exception:  # pragma: no cover - defensive catch for unhandled socket exceptions
         pass
     finally:
         registry.remove(user.user_id, websocket)

@@ -116,12 +116,16 @@ def test_no_frame_within_timeout_closes_with_4401(monkeypatch: pytest.MonkeyPatc
     ("frame_action", "expected_code", "expected_reason"),
     [
         ("non_json", 4401, "invalid_token"),
+        ("json_array", 4401, "invalid_token"),
         ("wrong_type", 4401, "invalid_token"),
         ("missing_token", 4401, "invalid_token"),
+        ("empty_token", 4401, "invalid_token"),
+        ("non_string_token", 4401, "invalid_token"),
         ("expired_token", 4401, "token_expired"),
         ("refresh_token", 4401, "invalid_token"),
         ("garbage_token", 4401, "invalid_token"),
         ("unknown_user_token", 4401, "invalid_token"),
+        ("non_uuid_sub", 4401, "invalid_token"),
     ],
 )
 def test_invalid_frames_close_with_4401_and_leave_registry_empty(
@@ -140,10 +144,16 @@ def test_invalid_frames_close_with_4401_and_leave_registry_empty(
             with client.websocket_connect("/ws") as ws:
                 if frame_action == "non_json":
                     ws.send_text("this is not valid json")
+                elif frame_action == "json_array":
+                    ws.send_text("[1, 2, 3]")
                 elif frame_action == "wrong_type":
                     ws.send_json({"type": "MESSAGE", "token": access_token})
                 elif frame_action == "missing_token":
                     ws.send_json({"type": "AUTH"})
+                elif frame_action == "empty_token":
+                    ws.send_json({"type": "AUTH", "token": ""})
+                elif frame_action == "non_string_token":
+                    ws.send_json({"type": "AUTH", "token": 12345})
                 elif frame_action == "expired_token":
                     expired = create_access_token(uid, expires_delta=timedelta(seconds=-10))
                     ws.send_json({"type": "AUTH", "token": expired})
@@ -154,6 +164,9 @@ def test_invalid_frames_close_with_4401_and_leave_registry_empty(
                 elif frame_action == "unknown_user_token":
                     orphan_token = create_access_token(uuid.uuid4())
                     ws.send_json({"type": "AUTH", "token": orphan_token})
+                elif frame_action == "non_uuid_sub":
+                    bad_sub_token = create_access_token("not-a-valid-uuid")
+                    ws.send_json({"type": "AUTH", "token": bad_sub_token})
 
                 ws.receive_json()
 
@@ -189,3 +202,64 @@ def test_url_query_token_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
             f"Expected user {user_id} sockets to be 0, "
             f"got {len(registry.get(user_id))} (total: {registry.count()})"
         )
+
+
+def test_client_disconnect_before_auth_frame_leaves_registry_clean() -> None:
+    """Client disconnecting immediately before sending any frame exits cleanly."""
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.close()
+
+    assert wait_until(lambda: registry.count() == 0), (
+        f"Expected registry count to be 0, got {registry.count()}"
+    )
+
+
+def test_connection_registry_unit_methods() -> None:
+    """Unit tests for ConnectionRegistry edge cases, duplicate additions, and error paths."""
+    from app.ws.registry import ConnectionRegistry
+
+    reg = ConnectionRegistry()
+    fake_ws1 = object()  # type: ignore[assignment]
+    fake_ws2 = object()  # type: ignore[assignment]
+    fake_ws3 = object()  # type: ignore[assignment]
+
+    user_id = uuid.uuid4()
+    str_user_id = str(user_id)
+
+    # 1. Invalid UUID handling in remove and get
+    reg.remove("not-a-valid-uuid", fake_ws1)
+    assert reg.get("not-a-valid-uuid") == []
+
+    # 2. Remove for user not in registry
+    reg.remove(user_id, fake_ws1)
+    assert reg.count() == 0
+
+    # 3. Add connection using string user ID
+    reg.add(str_user_id, fake_ws1)
+    assert reg.count() == 1
+    assert reg.get(user_id) == [fake_ws1]
+
+    # 4. Duplicate add is a no-op
+    reg.add(user_id, fake_ws1)
+    assert len(reg.get(user_id)) == 1
+
+    # 5. Add second socket for same user
+    reg.add(user_id, fake_ws2)
+    assert len(reg.get(user_id)) == 2
+    assert reg.count() == 2
+
+    # 6. Remove unknown socket for registered user (ValueError caught)
+    reg.remove(user_id, fake_ws3)
+    assert len(reg.get(user_id)) == 2
+
+    # 7. Remove first socket: second socket remains, key preserved
+    reg.remove(user_id, fake_ws1)
+    assert reg.get(user_id) == [fake_ws2]
+    assert user_id in reg.connected_user_ids()
+
+    # 8. Remove second socket: list emptied and key deleted
+    reg.remove(user_id, fake_ws2)
+    assert reg.get(user_id) == []
+    assert user_id not in reg.connected_user_ids()
+    assert reg.count() == 0
