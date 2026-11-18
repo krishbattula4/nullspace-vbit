@@ -122,3 +122,13 @@ async def test_auth_me_deleted_user_returns_invalid_token(client: AsyncClient) -
     assert res.status_code == 401
     assert res.json()["detail"] == "invalid_token"
     assert res.headers.get("WWW-Authenticate") == "Bearer"
+
+
+@pytest.mark.asyncio
+async def test_auth_me_non_uuid_sub_returns_invalid_token(client: AsyncClient) -> None:
+    """GET /auth/me with an access token having a non-UUID sub claim returns 401 invalid_token."""
+    token = create_access_token("not-a-valid-uuid")
+    res = await client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+    assert res.status_code == 401
+    assert res.json()["detail"] == "invalid_token"
+    assert res.headers.get("WWW-Authenticate") == "Bearer"

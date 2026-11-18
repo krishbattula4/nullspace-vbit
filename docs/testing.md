@@ -111,3 +111,50 @@ Comprehensive end-to-end verification lifecycle tests covering complete multi-st
 - **Scenario 1 (`UNVERIFIED -> VERIFIED`)**: Alice and Bob establish a session, verify initial `UNVERIFIED` state, compute matching 60-digit safety numbers, and mark each other `VERIFIED`.
 - **Scenario 2 (`VERIFIED -> KEY_CHANGED`)**: Bob re-provisions with a fresh store and sends a prekey message to Alice. Verifies that Alice successfully decrypts and delivers the message, exactly one `KeyChangeEvent` is emitted, and `attachVerification`'s `onKeyChanged` callback receives both the `KeyChangeEvent` and the updated `TrustRecord` (powering the in-app banner warning).
 - **Scenario 3 (`KEY_CHANGED -> VERIFIED`)**: Following outgoing key change detection (`IdentityChangedError`), Alice invokes `acceptNewIdentity` to resume communication (state remains `KEY_CHANGED`). Alice and Bob verify matching new safety numbers (which differ from pre-change numbers), and invoke `markVerified` to transition to `VERIFIED` with cleared history and active Double Ratchet.
+
+---
+
+## Backend tests
+
+The backend test suite (`backend/tests/`) verifies API endpoints, authentication flows, WebSocket connections, password security, database models, schema constraints, and Alembic migrations. Tests execute against SQLite in memory or temporary files by default for local development, and against PostgreSQL 16 in continuous integration.
+
+### Running Backend Tests & Coverage
+
+```bash
+cd backend
+python -m ruff check .                                           # Linting and style verification
+python -m pytest -q                                              # Quick test suite execution
+python -m pytest -q --cov=app --cov-report=term-missing          # Full test suite with coverage enforcement gate
+```
+
+### Coverage Rule
+
+Task P1.7 establishes and enforces a strict code coverage gate on the backend's core authentication and connection management modules.
+
+- **Configuration**: Defined in `backend/pyproject.toml` under `[tool.coverage.run]` and `[tool.coverage.report]`.
+- **Branch Coverage**: `branch = true` enforces condition and branch decision tracking.
+- **Concurrency**: `concurrency = ["greenlet", "thread"]` enables accurate async execution context tracking across SQLAlchemy async session greenlets and thread pools.
+- **Modules Covered**:
+  - `app/api/auth.py` (Registration, login, refresh rotation, and logout endpoints)
+  - `app/core/security.py` (Bcrypt password hashing, length bounds, and verification)
+  - `app/core/tokens.py` (Access and refresh JWT creation, validation, and claims decoding)
+  - `app/core/deps.py` (FastAPI `get_current_user` Bearer authentication dependency)
+  - `app/api/ws.py` (Authenticated WebSocket handshake, timeout enforcement, and disconnect handling)
+  - `app/ws/registry.py` (In-memory WebSocket connection registry)
+- **Gate Threshold**: `fail_under = 90` requires at least 90% combined branch coverage across the specified modules. If coverage falls below 90%, `pytest` exits with code 1.
+- **CI Enforcement**: Configured in `.github/workflows/ci.yml` under the `Tests against PostgreSQL` step using `pytest -q -rs --cov=app --cov-report=term-missing`.
+
+### Backend Test File Matrix
+
+| Test File | Primary Modules Under Test | What It Proves |
+|---|---|---|
+| `backend/tests/test_auth_tokens.py` | `app/api/auth.py`, `app/core/tokens.py` | **JWT access and refresh lifecycle & endpoints**: Login credential verification; access and refresh JWT creation with expected claims; refresh token rotation issuing new pairs; reuse detection triggering revocation of all user tokens; database token expiration handling (`401 token_expired`); unknown JTI rejection (`401 invalid_token`); non-UUID claims validation; decode claims checking (missing/empty `sub`, missing `jti`, falsy `exp`); `jwt.decode` unexpected exception handling; token generation with custom expiration deltas and string user IDs; idempotent logout with/without JTI; concurrent registration `IntegrityError` rollback; constant-time dummy password hash caching across unknown user logins; log redaction (secrets never logged); and concurrent refresh atomicity. |
+| `backend/tests/test_deps.py` | `app/core/deps.py`, `app/api/auth.py` | **FastAPI authentication dependency & profile endpoint**: `get_current_user` Bearer token authentication for `GET /auth/me`; rejection of missing headers (`401 not_authenticated` + `WWW-Authenticate: Bearer`); malformed/non-Bearer authorization headers; garbage JWTs; expired access tokens; refresh tokens presented in place of access tokens; access tokens with non-UUID subjects; and deleted or nonexistent users in database. |
+| `backend/tests/test_ws_auth.py` | `app/api/ws.py`, `app/ws/registry.py` | **WebSocket handshake authentication & connection registry**: Immediate connection acceptance followed by first-frame `AUTH` requirement within timeout; handshake validation returning `AUTH_OK` and registering socket; registry tracking and automatic unregistering on socket close; multi-socket support for same user; timeout closure (`4401 auth_timeout`); invalid frame rejection (`4401 invalid_token` / `token_expired`) across non-JSON, JSON arrays, wrong action type, missing token, empty token string, non-string token, expired token, refresh token, garbage token, unknown user token, and non-UUID subject token; rejection of token in URL query parameter; immediate client disconnect before frame transmission; and `ConnectionRegistry` unit methods (invalid UUID error handling, unknown user removal, duplicate add deduplication, removal of unknown sockets for known users, and cleanup on last socket removal). All socket disconnects verified with `wait_until` polling helper. |
+| `backend/tests/test_security.py` | `app/core/security.py` | **Cryptographic password hashing and verification**: Bcrypt password hashing using configured or default rounds; 72 UTF-8 byte boundary enforcement preventing silent truncation (raising `ValueError` in `hash_password`); password verification for matching and mismatched passwords; graceful rejection (> 72 byte passwords, malformed hashes, empty strings, `None` inputs returning `False` without raising); and threadpool async wrappers (`hash_password_async`, `verify_password_async`). |
+| `backend/tests/test_register.py` | `app/api/auth.py`, `app/core/security.py` | **User registration endpoint**: User account creation (`POST /auth/register`) returning 201 and `UserPublic` schema; exclusion of password hashes from responses; password verification against stored bcrypt hashes; duplicate username conflict detection (`409 username_taken`, case-insensitive); payload validation (username length, allowed characters, minimum password length, max 72 bytes, password != username); display name defaulting and whitespace trimming; log redaction; and concurrent registration conflict handling. |
+| `backend/tests/test_health.py` | `app/api/health.py` | **System health endpoint**: `GET /health` returning status 200 and application health status. |
+| `backend/tests/test_users_model.py` | `app/models/user.py` | **SQLAlchemy User model**: UUID primary key default generation; username and display name column constraints; lowercase username storage invariant; and timestamp auto-generation. |
+| `backend/tests/test_schema.py` | `app/models/` | **Database schema, tables, and constraints**: Table definitions for users, refresh tokens, prekeys, conversations, messages, message versions, and attachments; CHECK constraints (`ck_conversations_user_order`, `ck_users_username_lowercase`); foreign keys with cascade behaviors; and SQLite/PostgreSQL cross-compatibility. |
+| `backend/tests/test_migrations.py` | `alembic/` | **Alembic database migrations**: Clean application of all migration revisions from empty database to head; downgrade verification; and synchronization check ensuring ORM model definitions match migration revisions without unhandled schema drift. |
+

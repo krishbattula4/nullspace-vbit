@@ -43,7 +43,7 @@ jobs:
         env:
           DATABASE_URL: postgresql+asyncpg://nullspace:nullspace@localhost:5432/nullspace_test
           JWT_SECRET: ci-secret
-        run: pytest -q -rs
+        run: pytest -q -rs --cov=app --cov-report=term-missing
 
   frontend:
     runs-on: ubuntu-latest

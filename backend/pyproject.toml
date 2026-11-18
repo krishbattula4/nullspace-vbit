@@ -9,3 +9,18 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+concurrency = ["greenlet", "thread"]
+
+[tool.coverage.report]
+include = [
+    "app/api/auth.py",
+    "app/core/security.py",
+    "app/core/tokens.py",
+    "app/core/deps.py",
+]
+fail_under = 90
+show_missing = true
