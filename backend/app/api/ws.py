@@ -1,22 +1,54 @@
-"""WebSocket endpoint and handshake authentication."""
+"""WebSocket endpoint, handshake authentication, and connection heartbeat."""
 import asyncio
 import json
 import logging
+import time
 import uuid
 
 from fastapi import APIRouter, WebSocket
 from sqlalchemy import select
 from starlette.websockets import WebSocketDisconnect
 
+from app.core.config import get_settings
 from app.core.db import get_session_factory
 from app.core.tokens import TokenError, TokenExpired, TokenInvalid, decode_token
 from app.models.user import User
 from app.ws.registry import registry
 
 AUTH_TIMEOUT_SECONDS: float = 5.0
+HEARTBEAT_INTERVAL_SECONDS: float = 30.0
+HEARTBEAT_TIMEOUT_SECONDS: float = 60.0
 
 router = APIRouter(tags=["websocket"])
 log = logging.getLogger("nullspace.ws")
+
+
+async def _heartbeat_loop(websocket: WebSocket) -> None:
+    """Send periodic PING frames to keep the connection alive.
+
+    Reads HEARTBEAT_INTERVAL_SECONDS and HEARTBEAT_TIMEOUT_SECONDS at call time
+    to support runtime monkeypatching in tests without cached values.
+    """
+    try:
+        while True:
+            interval = HEARTBEAT_INTERVAL_SECONDS
+            await asyncio.sleep(interval)
+
+            timeout = HEARTBEAT_TIMEOUT_SECONDS
+            last_seen = registry.get_last_seen(websocket)
+            if last_seen is not None and (time.monotonic() - last_seen) >= timeout:
+                try:
+                    await websocket.close(code=4408, reason="heartbeat_timeout")
+                except Exception:
+                    pass
+                break
+
+            await websocket.send_json({"type": "PING"})
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Socket was closed or disconnected during heartbeat send
+        pass
 
 
 @router.websocket("/ws")
@@ -93,14 +125,87 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         return
 
     registry.add(user.user_id, websocket)
+    heartbeat_task: asyncio.Task[None] | None = None
     try:
         await websocket.send_json({"type": "AUTH_OK", "user_id": str(user.user_id)})
+        heartbeat_task = asyncio.create_task(_heartbeat_loop(websocket))
+        websocket.state.heartbeat_task = heartbeat_task
+
         while True:
-            # Message handling arrives in task P2.3; frames are ignored for now
-            await websocket.receive()
+            timeout = HEARTBEAT_TIMEOUT_SECONDS
+            try:
+                message = await asyncio.wait_for(websocket.receive(), timeout=timeout)
+            except TimeoutError:
+                try:
+                    await websocket.close(code=4408, reason="heartbeat_timeout")
+                except Exception:
+                    pass
+                break
+
+            if message["type"] == "websocket.disconnect":
+                break
+
+            # Refresh last_seen whenever any frame is received
+            registry.touch(websocket)
+
+            # Check incoming message size against max_message_bytes
+            raw_text = message.get("text")
+            raw_bytes = message.get("bytes")
+
+            if raw_bytes is not None:
+                frame_bytes_len = len(raw_bytes)
+            elif raw_text is not None:
+                frame_bytes_len = len(raw_text.encode("utf-8"))
+            else:
+                frame_bytes_len = 0
+
+            max_bytes = get_settings().max_message_bytes
+            if frame_bytes_len > max_bytes:
+                try:
+                    await websocket.close(code=1009, reason="message_too_big")
+                except Exception:
+                    pass
+                break
+
+            # Ignore binary frames
+            if raw_bytes is not None:
+                continue
+
+            # Process text frame
+            if raw_text is not None:
+                try:
+                    payload = json.loads(raw_text)
+                except Exception:
+                    # Ignore malformed non-JSON text frames
+                    continue
+
+                if not isinstance(payload, dict):
+                    continue
+
+                msg_type = payload.get("type")
+                if msg_type == "PING":
+                    await websocket.send_json({"type": "PONG"})
+                elif msg_type == "PONG":
+                    pass
+                else:
+                    # Ignore unknown message types
+                    pass
+
     except WebSocketDisconnect:
         pass
-    except Exception:  # pragma: no cover - defensive catch for unhandled socket exceptions
-        pass
+    except Exception as exc:
+        log.error("Unexpected error in WebSocket connection: %s", exc)
+        try:
+            await websocket.close(code=1011, reason="internal_error")
+        except Exception:
+            pass
     finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
         registry.remove(user.user_id, websocket)
