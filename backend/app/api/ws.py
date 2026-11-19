@@ -13,7 +13,14 @@ from app.core.config import get_settings
 from app.core.db import get_session_factory
 from app.core.tokens import TokenError, TokenExpired, TokenInvalid, decode_token
 from app.models.user import User
+from app.ws.envelope import (
+    CLIENT_FRAME_TYPES,
+    EnvelopeError,
+    error_frame,
+    parse_client_frame,
+)
 from app.ws.registry import registry
+from app.ws.router import handle_message_frame
 
 AUTH_TIMEOUT_SECONDS: float = 5.0
 HEARTBEAT_INTERVAL_SECONDS: float = 30.0
@@ -187,6 +194,18 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await websocket.send_json({"type": "PONG"})
                 elif msg_type == "PONG":
                     pass
+                elif "v" in payload or msg_type in CLIENT_FRAME_TYPES:
+                    try:
+                        frame = parse_client_frame(raw_text)
+                    except EnvelopeError as err:
+                        await websocket.send_json(error_frame(err))
+                        continue
+
+                    if frame.type == "MESSAGE":
+                        await handle_message_frame(user.user_id, websocket, frame)
+                    else:
+                        # Ignore unsupported frame types for now, as specified by the task
+                        pass
                 else:
                     # Ignore unknown message types
                     pass
