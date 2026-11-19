@@ -17,7 +17,8 @@ export type DecryptErrorCode =
   | "identity_changed"
   | "payload_invalid"
   | "storage"
-  | "unknown";
+  | "unknown"
+  | "own_unavailable";
 
 export interface FailedEnvelopeRecord {
   messageId: string;
@@ -211,6 +212,11 @@ export class MessageStore {
   async getMessage(id: string): Promise<MessageRecord | undefined> {
     const db = await this.getDb();
     return db.get("messages", id);
+  }
+
+  async getByClientMsgId(clientMsgId: string): Promise<MessageRecord | undefined> {
+    const db = await this.getDb();
+    return db.getFromIndex("messages", "byClientMsgId", clientMsgId);
   }
 
   async addVersion(v: VersionRecord): Promise<boolean> {

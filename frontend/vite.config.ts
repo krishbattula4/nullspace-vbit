@@ -17,5 +17,9 @@ export default defineConfig({
   test: {
     environment: "node",
     setupFiles: ["./src/test/setup.ts"],
+    // Signal key generation and ratchet tests take 1 to 4 seconds each and run in parallel; the
+    // 5 second default is too close on a slow CI runner and caused random failures.
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
   },
 });
