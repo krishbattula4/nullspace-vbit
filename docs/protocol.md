@@ -563,3 +563,40 @@ Signal Double Ratchet sessions require sequential execution per peer. Nullspace 
 
 - **Replay Protection**: Because Signal Double Ratchet decryption is non-idempotent (decrypting the same ciphertext twice throws and can corrupt ratchet state), incoming `MESSAGE` frames check if version 1 already exists in the local `MessageStore` before calling `sessions.decrypt()`. Duplicate frames are discarded safely without decrypting.
 - **Decryption Failure Containment**: If decryption or payload decoding fails on an incoming frame (e.g. corrupted ciphertext or invalid payload), the error is contained: the message record is committed locally with `decryptFailed: true` (with no plaintext version), a `decryptFailed` event is emitted, and later incoming frames continue to process without crash.
+
+## Decrypt failures
+
+When an incoming message envelope cannot be decrypted or decoded, Nullspace persists the raw ciphertext in the `failedEnvelopes` store, records the classified failure code, prevents application crashes, and allows subsequent retries.
+
+### Classification of decryption error codes
+
+The engine classifies errors into seven canonical `DecryptErrorCode` values using observed error texts from `@privacyresearch/libsignal-protocol-typescript` (v0.0.16) and WebCrypto/IndexedDB:
+
+| `DecryptErrorCode` | Real observed error message / condition | Meaning |
+|---|---|---|
+| `no_session` | `Error: No record for device <peerId>.1`<br>`Error: Missing Signed PreKey for PreKeyWhisperMessage`<br>`Error: No session to encrypt message for <address>` | No active Signal session or matching prekey exists for the sender. |
+| `bad_mac` | `Error: Bad MAC`<br>`RangeError: index out of range: ...`<br>`Error: invalid wire type <n> at offset <m>`<br>`Error: Incompatible version number on WhisperMessage <version>` | Ciphertext corruption, authentication tag mismatch, or corrupted protobuf wire bytes. |
+| `replayed_or_old` | `Error [MessageCounterError]: Message key not found. The counter was repeated or the key was not filled.` | Counter was repeated, message was previously decrypted, or ratchet counter is expired. |
+| `identity_changed` | `IdentityChangedError: Identity key changed for peer: <peerId>` | Peer's public identity key differs from the stored trust record. |
+| `payload_invalid` | `MessagePayloadError: ...` | Ciphertext decrypted successfully, but inner JSON payload failed schema or media constraints. |
+| `storage` | `DOMException: QuotaExceededError`<br>`Error: ... IndexedDB ...`<br>`Error: ... transaction ...` | Local storage quota exceeded or IndexedDB transaction aborted while persisting state. |
+| `unknown` | Any other unrecognized exception | Unexpected runtime error. |
+
+### Auto-retry policy
+
+- **Auto-retried error codes**: Only envelopes with `lastErrorCode: "unknown"` or `lastErrorCode: "storage"` and `attempts < 3`.
+  - *Rationale*: Transient errors such as disk contention, temporary storage quota exhaustion, or unclassified runtime anomalies may resolve on subsequent message processing.
+- **Excluded from auto-retry**:
+  - `bad_mac`: Ciphertext corruption or MAC failure is permanent; waiting cannot repair corrupted bits.
+  - `replayed_or_old`: Repeated or expired ratchet counters cannot be decrypted by waiting.
+  - `identity_changed`: Requires explicit user verification or acceptance of the new identity key.
+  - `payload_invalid`: The decrypted payload violates structural schema rules and will fail every subsequent parse attempt.
+- **Trigger**: Executed within the same per-peer mutex lock immediately after any successful decryption from sender $X$ (normal receive or manual retry).
+- **Batch limit**: At most 20 envelopes per trigger, processed strictly in `receivedAt` ascending order.
+
+### Ciphertext deletion policy
+
+In accordance with Section 4 of `docs/threat-model.md`, when a message is marked deleted via `MessageStore.markDeleted(id)`:
+1. All versions in the `versions` store have their `plaintext` wiped to `""`.
+2. Any corresponding record in `failedEnvelopes` is permanently deleted (`deleteFailedEnvelope(id)`).
+**Rule**: The raw ciphertext of a deleted message must not stay on the user's device.

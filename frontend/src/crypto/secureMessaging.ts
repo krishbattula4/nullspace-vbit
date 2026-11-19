@@ -1,5 +1,9 @@
 import type { SessionManager } from "./session";
-import type { MessageStore, MessageRecord } from "../store/messageStore";
+import type {
+  MessageStore,
+  MessageRecord,
+  DecryptErrorCode,
+} from "../store/messageStore";
 import {
   type ClientFrame,
   type ServerFrame,
@@ -10,6 +14,7 @@ import {
   decodeMessagePayload,
   type MessagePayload,
 } from "./messagePayload";
+import { classifyDecryptError } from "./decryptErrors";
 
 export type SecureMessengerEvent = "message" | "update" | "decryptFailed";
 
@@ -188,72 +193,295 @@ export class SecureMessenger {
     });
   }
 
+  private async autoRetryFailedEnvelopes(senderId: string): Promise<void> {
+    try {
+      const envelopes = await this.messages.listFailedEnvelopes({ senderId });
+      const eligible = envelopes.filter(
+        (env) =>
+          (env.lastErrorCode === "unknown" || env.lastErrorCode === "storage") &&
+          env.attempts < 3,
+      );
+      const toRetry = eligible.slice(0, 20);
+
+      for (const envelope of toRetry) {
+        // If version 1 already exists, clean up and skip
+        const versions = await this.messages.getVersions(envelope.messageId);
+        if (versions.some((v) => v.versionNo === 1)) {
+          await this.messages.deleteFailedEnvelope(envelope.messageId);
+          await this.messages.markDecryptFailed(envelope.messageId, false);
+          continue;
+        }
+
+        try {
+          const plaintext = await this.sessions.decrypt(envelope.senderId, {
+            type: envelope.ctype,
+            body: envelope.body,
+          });
+          const payload = decodeMessagePayload(plaintext);
+
+          const receivedMsg: MessageRecord = {
+            id: envelope.messageId,
+            conversationId: envelope.conversationId,
+            senderId: envelope.senderId,
+            createdAt: envelope.receivedAt,
+            status: "DELIVERED",
+            currentVersion: 1,
+          };
+          await this.messages.putMessage(receivedMsg);
+          await this.messages.addVersion({
+            messageId: envelope.messageId,
+            versionNo: 1,
+            plaintext,
+            action: "CREATE",
+            createdAt: envelope.receivedAt,
+          });
+          await this.messages.deleteFailedEnvelope(envelope.messageId);
+          await this.messages.markDecryptFailed(envelope.messageId, false);
+          this.emit("message", { ...receivedMsg, payload });
+        } catch (err) {
+          const code = classifyDecryptError(err);
+          await this.messages.incrementFailedAttempts(envelope.messageId, code);
+          await this.messages.markDecryptFailed(envelope.messageId, true, code);
+        }
+      }
+    } catch {
+      // Auto-retry failures must never crash or throw
+    }
+  }
+
+  async retryDecrypt(
+    messageId: string,
+  ): Promise<
+    | { status: "ok" }
+    | { status: "failed"; code: DecryptErrorCode }
+    | { status: "not_found" }
+  > {
+    try {
+      const initialEnvelope = await this.messages.getFailedEnvelope(messageId);
+      if (!initialEnvelope) {
+        const versions = await this.messages.getVersions(messageId);
+        if (versions.some((v) => v.versionNo === 1)) {
+          await this.messages.markDecryptFailed(messageId, false);
+          return { status: "ok" };
+        }
+        return { status: "not_found" };
+      }
+
+      return await this.withPeerLock(initialEnvelope.senderId, async () => {
+        const envelope = await this.messages.getFailedEnvelope(messageId);
+        if (!envelope) {
+          const versions = await this.messages.getVersions(messageId);
+          if (versions.some((v) => v.versionNo === 1)) {
+            await this.messages.markDecryptFailed(messageId, false);
+            return { status: "ok" };
+          }
+          return { status: "not_found" };
+        }
+
+        // If a version 1 already exists (decrypted meanwhile) delete envelope, clear flag, return ok
+        const versions = await this.messages.getVersions(messageId);
+        if (versions.some((v) => v.versionNo === 1)) {
+          await this.messages.deleteFailedEnvelope(messageId);
+          await this.messages.markDecryptFailed(messageId, false);
+          return { status: "ok" };
+        }
+
+        try {
+          const plaintext = await this.sessions.decrypt(envelope.senderId, {
+            type: envelope.ctype,
+            body: envelope.body,
+          });
+          const payload = decodeMessagePayload(plaintext);
+
+          const receivedMsg: MessageRecord = {
+            id: envelope.messageId,
+            conversationId: envelope.conversationId,
+            senderId: envelope.senderId,
+            createdAt: envelope.receivedAt,
+            status: "DELIVERED",
+            currentVersion: 1,
+          };
+          await this.messages.putMessage(receivedMsg);
+          await this.messages.addVersion({
+            messageId: envelope.messageId,
+            versionNo: 1,
+            plaintext,
+            action: "CREATE",
+            createdAt: envelope.receivedAt,
+          });
+          await this.messages.deleteFailedEnvelope(messageId);
+          await this.messages.markDecryptFailed(messageId, false);
+          this.emit("message", { ...receivedMsg, payload });
+
+          // Auto-retry eligible failed envelopes for this sender
+          await this.autoRetryFailedEnvelopes(envelope.senderId);
+
+          return { status: "ok" };
+        } catch (err) {
+          const code = classifyDecryptError(err);
+          await this.messages.incrementFailedAttempts(messageId, code);
+          await this.messages.markDecryptFailed(messageId, true, code);
+          return { status: "failed", code };
+        }
+      });
+    } catch {
+      return { status: "failed", code: "storage" };
+    }
+  }
+
+  async listFailed(conversationId: string): Promise<MessageRecord[]> {
+    const envelopes = await this.messages.listFailedEnvelopes({ conversationId });
+    const records: MessageRecord[] = [];
+    const seenIds = new Set<string>();
+
+    for (const env of envelopes) {
+      const msg = await this.messages.getMessage(env.messageId);
+      if (msg && msg.decryptFailed) {
+        records.push(msg);
+        seenIds.add(msg.id);
+      }
+    }
+
+    const allConvMessages = await this.messages.listMessages(conversationId, { limit: 1000 });
+    for (const msg of allConvMessages) {
+      if (msg.decryptFailed && !seenIds.has(msg.id)) {
+        records.push(msg);
+        seenIds.add(msg.id);
+      }
+    }
+
+    records.sort((a, b) => {
+      if (a.createdAt !== b.createdAt) {
+        return a.createdAt.localeCompare(b.createdAt);
+      }
+      return a.id.localeCompare(b.id);
+    });
+
+    return records;
+  }
+
   async onServerFrame(frame: ServerFrame): Promise<void> {
     switch (frame.type) {
       case "MESSAGE": {
-        await this.withPeerLock(frame.sender_id, async () => {
-          // (1) if messages already has version 1 for frame.message_id, ignore it and do NOT call decrypt
-          const versions = await this.messages.getVersions(frame.message_id);
-          if (versions.some((v) => v.versionNo === 1)) {
-            return;
-          }
-
-          const existingMsg = await this.messages.getMessage(frame.message_id);
-          if (existingMsg?.decryptFailed) {
-            return;
-          }
-
-          // (2) decrypt; (3) decode; (4) store; (5) emit
-          try {
-            const plaintext = await this.sessions.decrypt(frame.sender_id, {
-              type: frame.ctype,
-              body: frame.body,
-            });
-            const payload = decodeMessagePayload(plaintext);
-
-            const receivedMsg: MessageRecord = {
-              id: frame.message_id,
-              conversationId: frame.conversation_id,
-              senderId: frame.sender_id,
-              createdAt: frame.created_at,
-              status: "DELIVERED",
-              currentVersion: 1,
-            };
-            await this.messages.putMessage(receivedMsg);
-            await this.messages.addVersion({
-              messageId: frame.message_id,
-              versionNo: 1,
-              plaintext,
-              action: "CREATE",
-              createdAt: frame.created_at,
-            });
-            this.emit("message", { ...receivedMsg, payload });
-          } catch (err) {
-            // Decryption or payload decoding failed. Never overwrite a message that was stored
-            // successfully in the meantime (for example by another tab).
-            const alreadyStored = await this.messages.getVersions(frame.message_id);
-            if (alreadyStored.some((v) => v.versionNo === 1)) {
+        try {
+          await this.withPeerLock(frame.sender_id, async () => {
+            // (1) if messages already has version 1 for frame.message_id, ignore it and do NOT call decrypt
+            const versions = await this.messages.getVersions(frame.message_id);
+            if (versions.some((v) => v.versionNo === 1)) {
               return;
             }
-            const failedRecord: MessageRecord = {
-              id: frame.message_id,
-              conversationId: frame.conversation_id,
-              senderId: frame.sender_id,
-              createdAt: frame.created_at,
-              status: "DELIVERED",
-              currentVersion: 1,
-              decryptFailed: true,
-            };
-            await this.messages.putMessage(failedRecord);
-            await this.messages.markDecryptFailed(frame.message_id, true);
-            this.emit("decryptFailed", {
-              messageId: frame.message_id,
-              conversationId: frame.conversation_id,
-              senderId: frame.sender_id,
-              error: err,
-            });
-          }
-        });
+
+            // If a failed envelope already exists for that message id (a replay of a failed frame)
+            // do not reset its attempts; ignore the replay.
+            const existingEnv = await this.messages.getFailedEnvelope(frame.message_id);
+            if (existingEnv) {
+              return;
+            }
+
+            const existingMsg = await this.messages.getMessage(frame.message_id);
+            if (existingMsg?.decryptFailed) {
+              return;
+            }
+
+            // (2) decrypt; (3) decode; (4) store; (5) emit
+            try {
+              const plaintext = await this.sessions.decrypt(frame.sender_id, {
+                type: frame.ctype,
+                body: frame.body,
+              });
+              const payload = decodeMessagePayload(plaintext);
+
+              const receivedMsg: MessageRecord = {
+                id: frame.message_id,
+                conversationId: frame.conversation_id,
+                senderId: frame.sender_id,
+                createdAt: frame.created_at,
+                status: "DELIVERED",
+                currentVersion: 1,
+              };
+              await this.messages.putMessage(receivedMsg);
+              await this.messages.addVersion({
+                messageId: frame.message_id,
+                versionNo: 1,
+                plaintext,
+                action: "CREATE",
+                createdAt: frame.created_at,
+              });
+              this.emit("message", { ...receivedMsg, payload });
+
+              // Auto-retry eligible failed envelopes for this sender
+              await this.autoRetryFailedEnvelopes(frame.sender_id);
+            } catch (err) {
+              try {
+                // Decryption or payload decoding failed. Never overwrite a message that was stored
+                // successfully in the meantime (for example by another tab).
+                const alreadyStored = await this.messages.getVersions(frame.message_id);
+                if (alreadyStored.some((v) => v.versionNo === 1)) {
+                  return;
+                }
+
+                // Check again if a failed envelope already exists
+                const envCheck = await this.messages.getFailedEnvelope(frame.message_id);
+                if (envCheck) {
+                  return;
+                }
+
+                const code = classifyDecryptError(err);
+
+                // Store the ciphertext with saveFailedEnvelope (attempts 1) BEFORE anything else
+                await this.messages.saveFailedEnvelope({
+                  messageId: frame.message_id,
+                  conversationId: frame.conversation_id,
+                  senderId: frame.sender_id,
+                  ctype: frame.ctype,
+                  body: frame.body,
+                  receivedAt: frame.created_at,
+                  attempts: 1,
+                  lastErrorCode: code,
+                });
+
+                const failedRecord: MessageRecord = {
+                  id: frame.message_id,
+                  conversationId: frame.conversation_id,
+                  senderId: frame.sender_id,
+                  createdAt: frame.created_at,
+                  status: "DELIVERED",
+                  currentVersion: 1,
+                  decryptFailed: true,
+                  decryptErrorCode: code,
+                };
+                await this.messages.putMessage(failedRecord);
+                await this.messages.markDecryptFailed(frame.message_id, true, code);
+
+                this.emit("decryptFailed", {
+                  messageId: frame.message_id,
+                  conversationId: frame.conversation_id,
+                  senderId: frame.sender_id,
+                  code,
+                  error: err,
+                });
+              } catch (storageErr) {
+                // Saving the failure record itself failed (swallow and emit "decryptFailed" with code "storage")
+                this.emit("decryptFailed", {
+                  messageId: frame.message_id,
+                  conversationId: frame.conversation_id,
+                  senderId: frame.sender_id,
+                  code: "storage",
+                  error: storageErr,
+                });
+              }
+            }
+          });
+        } catch (outerErr) {
+          // withPeerLock or mutex wrapper failed: never throw for any MESSAGE frame
+          this.emit("decryptFailed", {
+            messageId: frame.message_id,
+            conversationId: frame.conversation_id,
+            senderId: frame.sender_id,
+            code: "storage",
+            error: outerErr,
+          });
+        }
         break;
       }
 
