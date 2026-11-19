@@ -154,3 +154,10 @@ Nullspace models message lifecycle transitions across four explicit actions (`CR
 The Curve25519 identity key (`0x05` prefix, 33 bytes raw) is stored directly on `users`:
 - **Long-term vs Ephemeral Keys**: One-time prekeys are consumed on session initiation, and signed prekeys are rotated periodically. In contrast, the identity key is the user's permanent cryptographic identity.
 - **Out-of-band Verification**: Trust On First Use (TOFU), safety number computation (5200 iterations of SHA-512 via libsignal's `FingerprintGenerator`), and key change alerts require direct access to the stable identity public key.
+
+### 5. Key Directory and Prekey Lifecycle
+The `prekeys` table models published public keys for Double Ratchet / X3DH session establishment:
+- **Relationship**: Prekeys belong to `users` via `user_id` foreign key with `ON DELETE CASCADE`.
+- **Key Kinds**: `SIGNED` (medium-term signed prekey with 64-byte XEdDSA signature) and `ONE_TIME` (ephemeral prekey, `signature` must be NULL, enforced by `ck_prekeys_signature_rule`).
+- **Atomic Consumption**: When peers request a prekey bundle (`GET /keys/bundle/{user_id}`), at most one unconsumed one-time prekey (`consumed_at IS NULL`) is atomically marked consumed (`consumed_at = now`) via conditional update with optimistic concurrency control. Once consumed, an OTPK is never offered again.
+- **Re-registration**: When a user uploads a bundle with a new identity key, the server treats it as re-registration and purges all existing unconsumed one-time prekeys, preventing stale prekeys from being paired with the new identity.
