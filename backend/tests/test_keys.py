@@ -425,9 +425,7 @@ async def test_concurrent_bundle_consumption_atomic(
     """Concurrent bundle fetches atomically consume distinct OTPKs (requires PostgreSQL)."""
     settings = get_settings()
     if not settings.sqlalchemy_url.startswith("postgresql"):
-        pytest.skip(
-            "SQLite locking makes concurrent prekey consumption test flaky; requires PostgreSQL"
-        )
+        pytest.skip("requires PostgreSQL")
 
     alice = await _create_test_user(db_session, "alice_concurrent")
     headers = _auth_header(alice)
@@ -455,3 +453,75 @@ async def test_concurrent_bundle_consumption_atomic(
     assert len(claimed_keys) == 100
     assert len(set(claimed_keys)) == 100
     assert empty_responses == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_two_fetches_never_duplicate(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Two simultaneous bundle fetches never return the same OTPK twice (requires PostgreSQL)."""
+    settings = get_settings()
+    if not settings.sqlalchemy_url.startswith("postgresql"):
+        pytest.skip("requires PostgreSQL")
+
+    alice = await _create_test_user(db_session, "alice_two_fetch")
+    bob = await _create_test_user(db_session, "bob_two_fetch")
+    alice_headers = _auth_header(alice)
+    bob_headers = _auth_header(bob)
+
+    # Deterministic bundle with 2 available one-time prekeys
+    payload = _make_bundle_payload(
+        str(alice.user_id),
+        signed_id=1,
+        otpk_specs=[(101, 11), (102, 22)],
+    )
+    up_res = await client.put("/keys/bundle", json=payload, headers=alice_headers)
+    assert up_res.status_code == 200
+
+    # Two simultaneous GET requests
+    res1, res2 = await asyncio.gather(
+        client.get(f"/keys/bundle/{alice.user_id}", headers=bob_headers),
+        client.get(f"/keys/bundle/{alice.user_id}", headers=bob_headers),
+    )
+
+    # Assert both requests succeed
+    assert res1.status_code == 200
+    assert res2.status_code == 200
+
+    data1 = res1.json()
+    data2 = res2.json()
+
+    # Each response contains at most one one-time prekey
+    otpks1 = data1["oneTimePreKeys"]
+    otpks2 = data2["oneTimePreKeys"]
+    assert len(otpks1) <= 1
+    assert len(otpks2) <= 1
+
+    # Extract returned key IDs
+    returned_keys = [item["keyId"] for item in otpks1 + otpks2]
+
+    # If both responses contain a one-time prekey, their key IDs are different
+    if len(otpks1) == 1 and len(otpks2) == 1:
+        assert otpks1[0]["keyId"] != otpks2[0]["keyId"]
+
+    # No one-time prekey is returned twice
+    assert len(returned_keys) == len(set(returned_keys))
+
+    # The database records the correct consumed state
+    db_otpks = (
+        (
+            await db_session.execute(
+                select(Prekey).where(
+                    Prekey.user_id == alice.user_id,
+                    Prekey.kind == PrekeyKind.ONE_TIME,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for p in db_otpks:
+        if p.key_id in returned_keys:
+            assert p.consumed_at is not None
+        else:
+            assert p.consumed_at is None
