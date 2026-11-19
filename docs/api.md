@@ -548,6 +548,174 @@ Returned when request parameters fail validation:
 
 ---
 
+## Key Directory
+
+### Upload Prekey Bundle
+
+Uploads or replenishes the public Signal Protocol prekey bundle for the authenticated user, establishing identity keys, medium-term signed prekeys, and one-time prekeys (OTPKs).
+
+- **Method**: `PUT`
+- **Path**: `/keys/bundle`
+- **Content-Type**: `application/json`
+- **Authentication**: Required (`Bearer <access_token>`)
+
+#### Request Body Schema
+
+| Field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `userId` | string | Yes | Must match authenticated caller's UUID | User identifier owning the prekey bundle. |
+| `registrationId` | integer | Yes | 1 to 16380 (strict integer) | Signal Protocol local registration ID. |
+| `identityKey` | string | Yes | Base64-encoded, exactly 33 bytes (Curve25519) | Long-term identity public key with `0x05` prefix. |
+| `signedPreKey` | object | Yes | Strict object: `keyId`, `publicKey`, `signature` | Medium-term signed prekey and signature. |
+| `signedPreKey.keyId` | integer | Yes | >= 1 (strict integer) | Unique identifier for the signed prekey. |
+| `signedPreKey.publicKey` | string | Yes | Base64-encoded, exactly 33 bytes (Curve25519) | Signed prekey public key bytes. |
+| `signedPreKey.signature` | string | Yes | Base64-encoded, exactly 64 bytes (Ed25519/XEdDSA) | Signature over the signed prekey public key. |
+| `oneTimePreKeys` | array | Yes | Maximum 200 items; unique `keyId`s | Array of one-time prekey objects (`keyId`, `publicKey`). May be empty. |
+| `oneTimePreKeys[].keyId`| integer | Yes | >= 1 (strict integer) | Unique identifier for the one-time prekey. |
+| `oneTimePreKeys[].publicKey` | string | Yes | Base64-encoded, exactly 33 bytes (Curve25519) | One-time prekey public key bytes. |
+| `createdAt` | string | Yes | ISO 8601 UTC timestamp format | Timestamp when the bundle was generated. |
+
+> [!NOTE]
+> The server does not verify the XEdDSA signature over the signed prekey because that requires libsignal/curve25519 cryptographic primitives. Cryptographic signature verification is strictly performed client-side by peers before establishing an X3DH session.
+
+#### Behavior & Invariants
+- **Re-registration**: If `identityKey` differs from the user's currently stored identity key, it is treated as a re-registration: the server deletes all unconsumed one-time prekeys for the user and reports `identity_changed: true`. If unchanged, reports `identity_changed: false`.
+- **Prekey ID Conflict**: If an uploaded prekey ID (signed or one-time) already exists in the database with a different public key, the server rejects the request with HTTP 409 `prekey_id_conflict`. The transaction is rolled back and nothing is stored.
+- **Idempotency**: An identical re-upload (same key ID and identical public key bytes) is ignored rather than creating duplicate records or throwing an error.
+
+#### Responses
+
+##### 200 OK
+Returned when the bundle is successfully stored or updated.
+
+**Response Body**:
+```json
+{
+  "identity_changed": false
+}
+```
+
+##### 401 Unauthorized
+Returned when authentication credentials are missing, invalid, or expired (`not_authenticated`, `invalid_token`, `token_expired`).
+
+##### 403 Forbidden
+Returned when the `userId` in the request body does not match the authenticated caller's user ID.
+
+**Response Body**:
+```json
+{
+  "detail": "user_mismatch"
+}
+```
+
+##### 409 Conflict
+Returned when a prekey ID already exists in the database with a different public key.
+
+**Response Body**:
+```json
+{
+  "detail": "prekey_id_conflict"
+}
+```
+
+##### 422 Unprocessable Entity
+Returned when payload fails validation:
+- Key bytes length mismatch (identity, signed prekey, or OTPK not 33 bytes; signature not 64 bytes).
+- Malformed base64 encoding.
+- Duplicate `keyId` values within `oneTimePreKeys`.
+- More than 200 one-time prekeys.
+- `registrationId` outside `1..16380`.
+- Unknown extra properties.
+
+---
+
+### Retrieve Peer Prekey Bundle
+
+Retrieves the public prekey bundle of a peer user to initiate an end-to-end encrypted session via X3DH.
+
+- **Method**: `GET`
+- **Path**: `/keys/bundle/{user_id}`
+- **Authentication**: Required (`Bearer <access_token>`)
+
+#### Behavior & Invariants
+- **Newest Signed Prekey**: Always returns the user's most recently uploaded signed prekey.
+- **Atomic OTPK Consumption**: Atomically burns at most ONE unconsumed one-time prekey using optimistic concurrency control (up to 5 retries). Once consumed, an OTPK is never returned again.
+- **Exhausted Prekeys**: If all one-time prekeys for the peer have been consumed, returns `oneTimePreKeys: []` (empty array) so the caller can still fall back to establishing a session without an OTPK.
+- **Schema Compliance**: The response strictly adheres to `docs/schemas/prekey-bundle.schema.json`.
+
+#### Responses
+
+##### 200 OK
+Returned when the peer's public bundle is successfully retrieved.
+
+**Response Body**:
+```json
+{
+  "userId": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "registrationId": 1234,
+  "identityKey": "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUF",
+  "signedPreKey": {
+    "keyId": 1,
+    "publicKey": "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUF",
+    "signature": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBw=="
+  },
+  "oneTimePreKeys": [
+    {
+      "keyId": 10,
+      "publicKey": "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUF"
+    }
+  ],
+  "createdAt": "2026-11-19T12:00:00Z"
+}
+```
+
+##### 401 Unauthorized
+Returned when authentication credentials are missing or invalid.
+
+##### 404 Not Found
+Returned when the requested user does not exist or has not uploaded a prekey bundle.
+
+**Response Body**:
+```json
+{
+  "detail": "bundle_not_found"
+}
+```
+
+##### 422 Unprocessable Entity
+Returned when `user_id` is not a valid UUID format.
+
+---
+
+### Get Key Inventory Count
+
+Returns the authenticated caller's inventory of available one-time prekeys and active signed prekey ID. Used by clients to monitor prekey depletion and determine when replenishment is needed.
+
+- **Method**: `GET`
+- **Path**: `/keys/count`
+- **Authentication**: Required (`Bearer <access_token>`)
+
+#### Responses
+
+##### 200 OK
+Returned with the caller's key inventory metrics.
+
+**Response Body**:
+```json
+{
+  "one_time_prekeys": 42,
+  "signed_prekey_id": 3
+}
+```
+
+> [!NOTE]
+> `signed_prekey_id` returns `null` if the user has not uploaded any signed prekeys. No private keys or raw key bytes are ever returned in count responses.
+
+##### 401 Unauthorized
+Returned when authentication credentials are missing or invalid.
+
+---
+
 ## Security and Privacy Rules
 
 1. **Password Hashing**: Passwords are hashed using standard bcrypt (`$2b$`) with cost factor configured via `BCRYPT_ROUNDS` (defaults to 12).
