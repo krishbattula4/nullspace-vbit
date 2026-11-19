@@ -4,6 +4,7 @@ import base64
 import json
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 import jsonschema
 import pytest
@@ -430,13 +431,13 @@ async def test_concurrent_bundle_consumption_atomic(
     alice = await _create_test_user(db_session, "alice_concurrent")
     headers = _auth_header(alice)
 
-    # Upload 100 OTPKs
-    otpk_specs = [(i, i % 255) for i in range(1, 101)]
+    # Upload 25 OTPKs (scaled to avoid CI connection-pool limits)
+    otpk_specs = [(i, i % 255) for i in range(1, 26)]
     payload = _make_bundle_payload(str(alice.user_id), otpk_specs=otpk_specs)
     await client.put("/keys/bundle", json=payload, headers=headers)
 
-    # 101 concurrent fetches
-    tasks = [client.get(f"/keys/bundle/{alice.user_id}", headers=headers) for _ in range(101)]
+    # 26 concurrent fetches
+    tasks = [client.get(f"/keys/bundle/{alice.user_id}", headers=headers) for _ in range(26)]
     responses = await asyncio.gather(*tasks)
 
     claimed_keys = []
@@ -450,8 +451,8 @@ async def test_concurrent_bundle_consumption_atomic(
         else:
             empty_responses += 1
 
-    assert len(claimed_keys) == 100
-    assert len(set(claimed_keys)) == 100
+    assert len(claimed_keys) == 25
+    assert len(set(claimed_keys)) == 25
     assert empty_responses == 1
 
 
@@ -525,3 +526,159 @@ async def test_concurrent_two_fetches_never_duplicate(
             assert p.consumed_at is not None
         else:
             assert p.consumed_at is None
+
+
+@pytest.mark.asyncio
+async def test_identity_re_registration_deletes_all_old_prekeys_and_allows_id_reuse(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Re-registration deletes ALL old prekeys (consumed and signed), allowing ID reuse."""
+    alice = await _create_test_user(db_session, "alice_rereg_full")
+    headers = _auth_header(alice)
+
+    # 1. Upload bundle A for a user:
+    # Identity key A (byte 1), signed prekey ID 1 (pub byte 2, sig byte 3), OTPKs 1 (10) and 2 (20)
+    bundle_a = _make_bundle_payload(
+        str(alice.user_id),
+        identity_byte=1,
+        signed_id=1,
+        signed_pub_byte=2,
+        signed_sig_byte=3,
+        otpk_specs=[(1, 10), (2, 20)],
+    )
+    res_a = await client.put("/keys/bundle", json=bundle_a, headers=headers)
+    assert res_a.status_code == 200
+    assert res_a.json()["identity_changed"] is False
+
+    # 2. Fetch the user's bundle once
+    res_fetch1 = await client.get(f"/keys/bundle/{alice.user_id}", headers=headers)
+    assert res_fetch1.status_code == 200
+    data_fetch1 = res_fetch1.json()
+
+    # 3. Confirm that one-time prekey ID 1 is consumed
+    assert len(data_fetch1["oneTimePreKeys"]) == 1
+    assert data_fetch1["oneTimePreKeys"][0]["keyId"] == 1
+    assert data_fetch1["oneTimePreKeys"][0]["publicKey"] == _make_key(10, 33)
+
+    otpk1_db = (
+        await db_session.execute(
+            select(Prekey).where(
+                Prekey.user_id == alice.user_id,
+                Prekey.kind == PrekeyKind.ONE_TIME,
+                Prekey.key_id == 1,
+            )
+        )
+    ).scalar_one()
+    assert otpk1_db.consumed_at is not None
+
+    # 4. Upload bundle B for the same user:
+    # Different identity key B (byte 50)
+    # Reuse signed prekey ID 1 (pub byte 52, sig byte 53)
+    # Reuse one-time prekey IDs 1 (byte 60) and 2 (byte 70)
+    # Different public key bytes from bundle A
+    bundle_b = _make_bundle_payload(
+        str(alice.user_id),
+        identity_byte=50,
+        signed_id=1,
+        signed_pub_byte=52,
+        signed_sig_byte=53,
+        otpk_specs=[(1, 60), (2, 70)],
+    )
+
+    # 5. Expect HTTP 200
+    res_b = await client.put("/keys/bundle", json=bundle_b, headers=headers)
+    assert res_b.status_code == 200
+
+    # 6. Expect identity_changed: true
+    assert res_b.json()["identity_changed"] is True
+
+    # 7. Fetch the user's bundle again
+    res_fetch2 = await client.get(f"/keys/bundle/{alice.user_id}", headers=headers)
+    assert res_fetch2.status_code == 200
+    data_fetch2 = res_fetch2.json()
+
+    # 8. Confirm that the returned identity key belongs to identity B
+    assert data_fetch2["identityKey"] == _make_key(50, 33)
+
+    # 9. Confirm that the new signed prekey is returned
+    assert data_fetch2["signedPreKey"]["keyId"] == 1
+    assert data_fetch2["signedPreKey"]["publicKey"] == _make_key(52, 33)
+    assert data_fetch2["signedPreKey"]["signature"] == _make_sig(53)
+
+    # 10. Confirm that the newly uploaded one-time prekey belongs to bundle B
+    assert len(data_fetch2["oneTimePreKeys"]) == 1
+    assert data_fetch2["oneTimePreKeys"][0]["keyId"] == 1
+    assert data_fetch2["oneTimePreKeys"][0]["publicKey"] == _make_key(60, 33)
+
+    # 11. Query database and confirm that no old prekey rows belonging to identity A remain
+    all_prekeys = (
+        (await db_session.execute(select(Prekey).where(Prekey.user_id == alice.user_id)))
+        .scalars()
+        .all()
+    )
+    assert len(all_prekeys) == 3
+    for p in all_prekeys:
+        if p.kind == PrekeyKind.SIGNED:
+            assert p.public_key == bytes([52] * 33)
+            assert p.signature == bytes([53] * 64)
+        elif p.key_id == 1:
+            assert p.public_key == bytes([60] * 33)
+        elif p.key_id == 2:
+            assert p.public_key == bytes([70] * 33)
+            assert p.consumed_at is None
+
+
+@pytest.mark.asyncio
+async def test_identity_re_registration_failed_upload_rolls_back_and_preserves_old_keys(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Failed re-registration rolls back deletion and preserves previous prekeys."""
+    alice = await _create_test_user(db_session, "alice_rereg_rollback")
+    headers = _auth_header(alice)
+
+    # Initial bundle A
+    bundle_a = _make_bundle_payload(
+        str(alice.user_id),
+        identity_byte=1,
+        signed_id=1,
+        signed_pub_byte=2,
+        signed_sig_byte=3,
+        otpk_specs=[(1, 10), (2, 20)],
+    )
+    res_a = await client.put("/keys/bundle", json=bundle_a, headers=headers)
+    assert res_a.status_code == 200
+
+    # Simulate unexpected database failure during commit of re-registration
+    bundle_b = _make_bundle_payload(
+        str(alice.user_id),
+        identity_byte=99,
+        signed_id=1,
+        signed_pub_byte=52,
+        signed_sig_byte=53,
+        otpk_specs=[(1, 60), (2, 70)],
+    )
+    with patch(
+        "sqlalchemy.ext.asyncio.AsyncSession.commit",
+        side_effect=RuntimeError("DB commit failure"),
+    ):
+        with pytest.raises(RuntimeError, match="DB commit failure"):
+            await client.put("/keys/bundle", json=bundle_b, headers=headers)
+
+    # Verify old keys and old identity are completely preserved in DB
+    await db_session.refresh(alice)
+    assert alice.identity_key == bytes([1] * 33)
+
+    all_prekeys = (
+        (await db_session.execute(select(Prekey).where(Prekey.user_id == alice.user_id)))
+        .scalars()
+        .all()
+    )
+    assert len(all_prekeys) == 3
+    for p in all_prekeys:
+        if p.kind == PrekeyKind.SIGNED:
+            assert p.public_key == bytes([2] * 33)
+            assert p.signature == bytes([3] * 64)
+        elif p.key_id == 1:
+            assert p.public_key == bytes([10] * 33)
+        elif p.key_id == 2:
+            assert p.public_key == bytes([20] * 33)

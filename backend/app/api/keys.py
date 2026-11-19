@@ -57,7 +57,7 @@ async def upload_prekey_bundle(
     signed_pub_bytes = base64.b64decode(bundle.signedPreKey.publicKey)
     signed_sig_bytes = base64.b64decode(bundle.signedPreKey.signature)
 
-    # 2. Check for re-registration: if stored identity key differs, purge unconsumed OTPKs
+    # 2. Check for re-registration: if stored identity key differs, delete ALL prekeys
     identity_changed = (
         current_user.identity_key is not None
         and current_user.identity_key != identity_key_bytes
@@ -66,17 +66,14 @@ async def upload_prekey_bundle(
     try:
         if identity_changed:
             await session.execute(
-                delete(Prekey).where(
-                    Prekey.user_id == current_user.user_id,
-                    Prekey.kind == PrekeyKind.ONE_TIME,
-                    Prekey.consumed_at.is_(None),
-                )
+                delete(Prekey).where(Prekey.user_id == current_user.user_id)
             )
-
-        # 3. Fetch existing prekeys for conflict detection and idempotency
-        stmt = select(Prekey).where(Prekey.user_id == current_user.user_id)
-        result = await session.execute(stmt)
-        existing_prekeys = {(p.kind, p.key_id): p for p in result.scalars().all()}
+            existing_prekeys = {}
+        else:
+            # 3. Fetch existing prekeys for conflict detection and idempotency
+            stmt = select(Prekey).where(Prekey.user_id == current_user.user_id)
+            result = await session.execute(stmt)
+            existing_prekeys = {(p.kind, p.key_id): p for p in result.scalars().all()}
 
         new_prekeys: list[Prekey] = []
 
@@ -211,6 +208,7 @@ async def get_prekey_bundle(
             )
             .order_by(Prekey.key_id.asc())
             .limit(1)
+            .with_for_update(skip_locked=True)
         )
         cand_res = await session.execute(cand_stmt)
         candidate = cand_res.scalar_one_or_none()
