@@ -10,6 +10,26 @@ export type MessageStatus =
 
 export type VersionAction = "CREATE" | "EDIT";
 
+export type DecryptErrorCode =
+  | "no_session"
+  | "bad_mac"
+  | "replayed_or_old"
+  | "identity_changed"
+  | "payload_invalid"
+  | "storage"
+  | "unknown";
+
+export interface FailedEnvelopeRecord {
+  messageId: string;
+  conversationId: string;
+  senderId: string;
+  ctype: 1 | 3;
+  body: string; // base64 ciphertext exactly as received
+  receivedAt: string; // ISO 8601 UTC
+  attempts: number;
+  lastErrorCode: DecryptErrorCode;
+}
+
 export interface MessageRecord {
   id: string;
   conversationId: string;
@@ -23,6 +43,7 @@ export interface MessageRecord {
   retractedAt?: string;
   retractedBy?: string;
   decryptFailed?: boolean;
+  decryptErrorCode?: DecryptErrorCode;
 }
 
 export interface VersionRecord {
@@ -59,6 +80,15 @@ export interface MessageDBSchema extends DBSchema {
     key: string;
     value: ConversationMetaRecord;
   };
+  failedEnvelopes: {
+    key: string;
+    value: FailedEnvelopeRecord;
+    indexes: {
+      bySenderId: string;
+      byConversationId: string;
+      byReceivedAt: string;
+    };
+  };
 }
 
 const STATUS_RANK: Record<MessageStatus, number> = {
@@ -91,31 +121,43 @@ export class MessageStore {
     }
 
     const dbName = this.dbName;
-    const db = await openDB<MessageDBSchema>(dbName, 1, {
-      upgrade(database) {
-        if (!database.objectStoreNames.contains("messages")) {
-          const msgStore = database.createObjectStore("messages", {
-            keyPath: "id",
-          });
-          msgStore.createIndex("byConversationTime", [
-            "conversationId",
-            "createdAt",
-            "id",
-          ]);
-          msgStore.createIndex("byClientMsgId", "clientMsgId", {
-            unique: true,
-          });
+    const db = await openDB<MessageDBSchema>(dbName, 2, {
+      upgrade(database, oldVersion) {
+        if (oldVersion < 1) {
+          if (!database.objectStoreNames.contains("messages")) {
+            const msgStore = database.createObjectStore("messages", {
+              keyPath: "id",
+            });
+            msgStore.createIndex("byConversationTime", [
+              "conversationId",
+              "createdAt",
+              "id",
+            ]);
+            msgStore.createIndex("byClientMsgId", "clientMsgId", {
+              unique: true,
+            });
+          }
+          if (!database.objectStoreNames.contains("versions")) {
+            const verStore = database.createObjectStore("versions", {
+              keyPath: ["messageId", "versionNo"],
+            });
+            verStore.createIndex("byMessage", "messageId");
+          }
+          if (!database.objectStoreNames.contains("meta")) {
+            database.createObjectStore("meta", {
+              keyPath: "conversationId",
+            });
+          }
         }
-        if (!database.objectStoreNames.contains("versions")) {
-          const verStore = database.createObjectStore("versions", {
-            keyPath: ["messageId", "versionNo"],
-          });
-          verStore.createIndex("byMessage", "messageId");
-        }
-        if (!database.objectStoreNames.contains("meta")) {
-          database.createObjectStore("meta", {
-            keyPath: "conversationId",
-          });
+        if (oldVersion < 2) {
+          if (!database.objectStoreNames.contains("failedEnvelopes")) {
+            const failedStore = database.createObjectStore("failedEnvelopes", {
+              keyPath: "messageId",
+            });
+            failedStore.createIndex("bySenderId", "senderId");
+            failedStore.createIndex("byConversationId", "conversationId");
+            failedStore.createIndex("byReceivedAt", "receivedAt");
+          }
         }
       },
       blocking() {
@@ -366,6 +408,12 @@ export class MessageStore {
       ) {
         existingRealMsg.decryptFailed = tempMsg.decryptFailed;
       }
+      if (
+        tempMsg.decryptErrorCode !== undefined &&
+        existingRealMsg.decryptErrorCode === undefined
+      ) {
+        existingRealMsg.decryptErrorCode = tempMsg.decryptErrorCode;
+      }
 
       await msgStore.put(existingRealMsg);
     } else {
@@ -398,9 +446,13 @@ export class MessageStore {
     details?: { at?: string; by?: string },
   ): Promise<void> {
     const db = await this.getDb();
-    const tx = db.transaction(["messages", "versions"], "readwrite");
+    const tx = db.transaction(
+      ["messages", "versions", "failedEnvelopes"],
+      "readwrite",
+    );
     const msgStore = tx.objectStore("messages");
     const verStore = tx.objectStore("versions");
+    const failedStore = tx.objectStore("failedEnvelopes");
 
     const msg = await msgStore.get(id);
     if (msg) {
@@ -418,6 +470,8 @@ export class MessageStore {
         await verStore.put(v);
       }
     }
+
+    await failedStore.delete(id);
 
     await tx.done;
   }
@@ -440,15 +494,94 @@ export class MessageStore {
     await tx.done;
   }
 
-  async markDecryptFailed(id: string, failed: boolean): Promise<void> {
+  async markDecryptFailed(
+    id: string,
+    failed: boolean,
+    code?: DecryptErrorCode,
+  ): Promise<void> {
     const db = await this.getDb();
     const tx = db.transaction("messages", "readwrite");
     const msg = await tx.store.get(id);
     if (msg) {
       msg.decryptFailed = failed;
+      if (failed) {
+        if (code !== undefined) {
+          msg.decryptErrorCode = code;
+        }
+      } else {
+        delete msg.decryptErrorCode;
+      }
       await tx.store.put(msg);
     }
     await tx.done;
+  }
+
+  async saveFailedEnvelope(rec: FailedEnvelopeRecord): Promise<void> {
+    const db = await this.getDb();
+    await db.put("failedEnvelopes", rec);
+  }
+
+  async getFailedEnvelope(
+    messageId: string,
+  ): Promise<FailedEnvelopeRecord | undefined> {
+    const db = await this.getDb();
+    return db.get("failedEnvelopes", messageId);
+  }
+
+  async listFailedEnvelopes(
+    filter?: { senderId?: string; conversationId?: string },
+  ): Promise<FailedEnvelopeRecord[]> {
+    const db = await this.getDb();
+    let records: FailedEnvelopeRecord[];
+    if (filter?.senderId) {
+      records = await db.getAllFromIndex(
+        "failedEnvelopes",
+        "bySenderId",
+        filter.senderId,
+      );
+      if (filter.conversationId) {
+        records = records.filter(
+          (r) => r.conversationId === filter.conversationId,
+        );
+      }
+    } else if (filter?.conversationId) {
+      records = await db.getAllFromIndex(
+        "failedEnvelopes",
+        "byConversationId",
+        filter.conversationId,
+      );
+    } else {
+      records = await db.getAll("failedEnvelopes");
+    }
+
+    records.sort((a, b) => {
+      if (a.receivedAt !== b.receivedAt) {
+        return a.receivedAt.localeCompare(b.receivedAt);
+      }
+      return a.messageId.localeCompare(b.messageId);
+    });
+
+    return records;
+  }
+
+  async incrementFailedAttempts(
+    messageId: string,
+    code: DecryptErrorCode,
+  ): Promise<void> {
+    const db = await this.getDb();
+    const tx = db.transaction("failedEnvelopes", "readwrite");
+    const rec = await tx.store.get(messageId);
+    if (rec) {
+      rec.attempts += 1;
+      rec.lastErrorCode = code;
+      await tx.store.put(rec);
+    }
+    await tx.done;
+  }
+
+  async deleteFailedEnvelope(messageId: string): Promise<void> {
+    const db = await this.getDb();
+    await db.delete("failedEnvelopes", messageId);
   }
 
   async getHistoryState(

@@ -18,9 +18,9 @@ nullspace-messages-${userId}
 ```
 Two accounts logged in consecutively or concurrently on the same browser never share an IndexedDB database or access each other's decrypted history.
 
-### Object Stores & Schema
+### Object Stores & Schema (Database Version 2)
 
-The database consists of three object stores:
+The database consists of four object stores:
 
 #### 1. `messages`
 Stores the metadata, status, version pointer, and flags for each chat message.
@@ -51,6 +51,7 @@ interface MessageRecord {
   retractedAt?: string;                                 // ISO timestamp when retracted (if retracted)
   retractedBy?: string;                                 // User ID who retracted the message
   decryptFailed?: boolean;                              // True if client failed to decrypt ciphertext
+  decryptErrorCode?: DecryptErrorCode;                  // Classification code if decryptFailed is true
 }
 ```
 
@@ -86,6 +87,29 @@ interface ConversationMetaRecord {
 }
 ```
 
+#### 4. `failedEnvelopes`
+Stores raw ciphertexts of incoming messages that failed decryption or payload parsing, supporting manual and automatic retry attempts.
+
+- **Primary Key (`keyPath`)**: `messageId` (`string`)
+- **Indexes**:
+  - `bySenderId` on `"senderId"`
+  - `byConversationId` on `"conversationId"`
+  - `byReceivedAt` on `"receivedAt"`
+
+**Record Structure (`FailedEnvelopeRecord`)**:
+```typescript
+interface FailedEnvelopeRecord {
+  messageId: string;                                    // Message UUID
+  conversationId: string;                               // Target conversation UUID
+  senderId: string;                                     // Sender user UUID
+  ctype: 1 | 3;                                         // 1: WhisperMessage, 3: PreKeyWhisperMessage
+  body: string;                                         // Raw base64 ciphertext
+  receivedAt: string;                                   // ISO 8601 UTC timestamp
+  attempts: number;                                     // Number of decryption attempts (>= 1)
+  lastErrorCode: DecryptErrorCode;                      // Classification code of the last failure
+}
+```
+
 ---
 
 ## Status State Machine
@@ -116,7 +140,8 @@ In accordance with Section 4 of `docs/threat-model.md` and the Nullspace protoco
 - **Store Behavior (`markDeleted`)**:
   - Sets `deletedAt` and `deletedBy` on the `MessageRecord`.
   - **Erases plaintext permanently**: Iterates over all `VersionRecord` rows for the message and overwrites `plaintext` with `""` (empty string).
-  - The message row and version rows are preserved as tombstones so that thread continuity and version indexing remain valid, but the confidential plaintext is erased from the client device.
+  - **Purges ciphertext envelope**: Deletes any corresponding envelope in `failedEnvelopes` so no raw ciphertext remains on the device.
+  - The message row and version rows are preserved as tombstones so that thread continuity and version indexing remain valid, but the confidential plaintext and ciphertext are erased from the client device.
   - Operation is idempotent.
 
 ### Retract (After Read)
