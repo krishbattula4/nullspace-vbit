@@ -521,3 +521,45 @@ Nullspace clients autonomously replenish one-time prekeys and rotate signed prek
 
 - **Single Flight**: Concurrent maintenance calls within the same process are deduplicated via an in-process Promise map (`inFlightMap`).
 - **Web Locks API**: Cross-tab concurrency is serialized using Web Locks API lock `nullspace-prekeys-${userId}`, falling back to in-process synchronization in non-supporting environments.
+
+
+## Message payload
+
+The end-to-end encrypted payload that travels inside the Signal Double Ratchet envelope (`ClientMessageFrame.body` / `ServerMessageFrame.body`). The application server only ever sees the ciphertext envelope and has no ability to inspect or tamper with the inner plaintext.
+
+### Payload Schema
+
+Message payloads are structured as strict JSON objects with a discriminating `type` field:
+
+```typescript
+export const MAX_TEXT_CHARS = 10_000;
+
+export type TextPayload = {
+  type: "TEXT";
+  text: string;
+};
+
+export type MessagePayload = TextPayload | MediaPayload;
+```
+
+### Validation Rules
+
+- **TEXT Payload**:
+  - `type` must be `"TEXT"`.
+  - Object must contain exactly two keys: `type` and `text` (no extraneous or unknown properties permitted).
+  - `text` must be a string, non-empty after trimming, and at most `MAX_TEXT_CHARS = 10_000` characters.
+- **IMAGE Payload**:
+  - Validated strictly via `parseMediaPayload(p)`: canonical lowercase UUID `media_id`, 32-byte base64 AES-GCM key, 12-byte base64 IV, 64-character lowercase hex SHA-256 digest, allowed image MIME type (`image/png`, `image/jpeg`, `image/gif`, `image/webp`), and size between 1 and 5 MiB.
+- **Strict Parsing**: Any invalid JSON, non-object, unknown payload `type`, extra property, or validation failure throws `MessagePayloadError`. Partial data is never accepted or returned.
+
+### Cryptographic Ordering & Ratchet Concurrency
+
+Signal Double Ratchet sessions require sequential execution per peer. Nullspace clients serialize outgoing encryption/send operations and incoming decryption operations using an in-memory per-peer promise mutex:
+- Encrypt+send for one peer and decrypt for one sender are strictly serialized.
+- Frames are transmitted over the wire in the exact sequence their ciphertexts were produced.
+- A failure in one operation (e.g. `IdentityChangedError`) does not stall or block subsequent operations in the queue.
+
+### Replay Protection & Decryption Error Containment
+
+- **Replay Protection**: Because Signal Double Ratchet decryption is non-idempotent (decrypting the same ciphertext twice throws and can corrupt ratchet state), incoming `MESSAGE` frames check if version 1 already exists in the local `MessageStore` before calling `sessions.decrypt()`. Duplicate frames are discarded safely without decrypting.
+- **Decryption Failure Containment**: If decryption or payload decoding fails on an incoming frame (e.g. corrupted ciphertext or invalid payload), the error is contained: the message record is committed locally with `decryptFailed: true` (with no plaintext version), a `decryptFailed` event is emitted, and later incoming frames continue to process without crash.
