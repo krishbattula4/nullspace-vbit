@@ -84,6 +84,22 @@ export class SecureMessenger {
 
   private peerLocks = new Map<string, Promise<void>>();
   private listeners = new Map<SecureMessengerEvent, Set<SecureMessengerEventHandler>>();
+  private lastMicros = 0;
+
+  /**
+   * Local timestamps for messages and versions THIS device creates. They are strictly
+   * increasing with microsecond precision (6 fraction digits, same format as the server's),
+   * even when two messages are created in the same millisecond or the system clock jumps
+   * backwards. Without this, messages created at the same instant tie on createdAt and are
+   * then ordered by their random id, so quickly sent messages could appear out of order.
+   */
+  private nextCreatedAt(): string {
+    const micros = Math.max(this.now().getTime() * 1000, this.lastMicros + 1);
+    this.lastMicros = micros;
+    const iso = new Date(Math.floor(micros / 1000)).toISOString(); // YYYY-MM-DDTHH:mm:ss.sssZ
+    const extra = String(micros % 1000).padStart(3, "0");
+    return `${iso.slice(0, 23)}${extra}Z`;
+  }
 
   constructor(options: SecureMessengerOptions) {
     this.userId = options.userId;
@@ -243,7 +259,7 @@ export class SecureMessenger {
       // a. clientMsgId = newId(); plaintext = encodeMessagePayload(payload)
       const clientMsgId = this.newId();
       const plaintext = encodeMessagePayload(payload);
-      const createdAt = this.now().toISOString();
+      const createdAt = this.nextCreatedAt();
 
       // b. Save the outgoing message locally FIRST: messages.putMessage(...) and messages.addVersion(...)
       const outgoingMsg: MessageRecord = {
@@ -426,7 +442,7 @@ export class SecureMessenger {
       const currentVersions = await this.messages.getVersions(messageId);
       const maxVer = currentVersions.reduce((max, v) => Math.max(max, v.versionNo), 0);
       const versionNo = maxVer + 1;
-      const createdAt = this.now().toISOString();
+      const createdAt = this.nextCreatedAt();
 
       await this.messages.addVersion({
         messageId,

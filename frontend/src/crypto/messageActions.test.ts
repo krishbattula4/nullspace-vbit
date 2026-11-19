@@ -451,8 +451,20 @@ describe("TASK P5.2: Edit, Delete and Retract in Secure Messaging Engine", () =>
       mime: "image/png",
       size: 1024,
     };
-    await aliceMessenger.sendPayload(conversationId, bobId, imagePayload);
-    const imageMsg = (await aliceMsgStore.listMessages(conversationId))[0];
+    const { clientMsgId: imageClientMsgId } = await aliceMessenger.sendPayload(
+      conversationId,
+      bobId,
+      imagePayload,
+    );
+    // Find the message by its client id. Do NOT assume it is listMessages()[0]: this test also
+    // inserts messages by hand with millisecond timestamps, which can tie with the engine's
+    // timestamp on a fast machine and then sort by random id (this caused a CI failure).
+    const imageMsg = (await aliceMsgStore.listMessages(conversationId)).find(
+      (m) => m.clientMsgId === imageClientMsgId,
+    );
+    if (!imageMsg) {
+      throw new Error("image message was not stored");
+    }
     expect(await aliceMessenger.canEdit(imageMsg.id)).toEqual({
       allowed: false,
       reason: "not_text",
