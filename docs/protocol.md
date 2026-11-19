@@ -261,9 +261,9 @@ type CipherEnvelope = {
   }
   ```
 
-### Parser Error Codes
+### Parser and Routing Error Codes
 
-When a received WebSocket data frame violates protocol rules, the server generates an `ERROR` frame with one of the following canonical error codes:
+When a received WebSocket data frame violates protocol rules or routing constraints, the server generates an `ERROR` frame with one of the following canonical error codes:
 
 | Error Code | Meaning |
 |---|---|
@@ -273,6 +273,29 @@ When a received WebSocket data frame violates protocol rules, the server generat
 | `unsupported_version` | The `"v"` field is not an integer, is a boolean, or is not equal to `1`. |
 | `unknown_type` | The `"type"` field is unrecognized, server-only frame sent by client, or control/client-only frame sent as data frame. |
 | `invalid_frame` | One or more fields failed validation (e.g. non-canonical UUID, invalid ctype, invalid base64, decoded payload > 65536 bytes, non-canonical padding, extra unknown fields). |
+| `conversation_not_found` | The requested conversation does not exist or the authenticated sender is not a participant in the conversation. |
+
+### Message Routing and Persistence Flow
+
+For incoming `MESSAGE` frames:
+
+1. **Client Transmission**: The client transmits an encrypted `MESSAGE` frame containing `conversation_id`, `client_msg_id`, `ctype` (`1` or `3`), and base64 `body`.
+2. **Envelope Validation**: The frame is checked against protocol version (`v: 1`) and client frame constraints. Malformed frames generate an `ERROR` frame (`invalid_frame`, `unsupported_version`, `unknown_type`), and the WebSocket connection remains open.
+3. **Session & Membership Validation**: A short-lived database session is opened for the frame. The server queries the conversation and verifies that the authenticated `sender_id` matches `user_a_id` or `user_b_id`. If the conversation does not exist or the sender is not a participant, the server sends an `ERROR` frame (`conversation_not_found`), stores no data, and aborts routing.
+4. **Idempotency Enforcement**: The server queries for an existing message using `(sender_id, client_msg_id)`. If found, no new message or version rows are inserted; the server immediately returns the original `ACK` referencing the existing server `message_id` and status. Uniqueness races on concurrent requests are safely handled via database uniqueness constraints and transaction rollbacks.
+5. **Ciphertext Storage & Persistence**:
+   - Exactly one `Message` row is created with server-generated UUID `id`, `conversation_id`, `sender_id`, `client_msg_id`, and initial status (`SENT` if recipient is online, otherwise `QUEUED`).
+   - Exactly one `MessageVersion` row is created (`version_no = 1`, `action = CREATE`, `actor_id = sender_id`, `ctype` from frame).
+   - Ciphertext in `body` is decoded from standard base64 into raw binary bytes and stored in `message_versions.ciphertext`. Plaintext message content is never received, stored, or logged.
+   - The database transaction commits before any delivery attempt occurs (**commit-before-push**).
+6. **Recipient Delivery**:
+   - The recipient is determined as the other conversation participant.
+   - An outgoing `MESSAGE` frame is constructed using `message_frame(...)` and pushed to the recipient using `registry.send_to_user(recipient_id, out_frame)`.
+   - The message is never routed back to the sender socket.
+7. **Delivery Status & Sender ACK**:
+   - If `send_to_user` delivers to at least one active socket, status is `SENT`.
+   - If the recipient has no active sockets (offline), status is `QUEUED`.
+   - The server transmits an `ACK` frame (`client_msg_id`, `message_id`, `status`) strictly to the originating WebSocket. If the sender has multiple connected tabs, only the tab that submitted the message receives the acknowledgment.
 
 REST (HTTPS) is used for one-shot operations: `/auth/*`, `/keys/*`, `/conversations/*`, `/media/*`, `/me/audit`.
 
