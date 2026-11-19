@@ -406,7 +406,7 @@ async def test_message_history_newest_first_and_pagination_limits(
 
     t_base = datetime(2026, 11, 19, 12, 0, 0, tzinfo=UTC)
     messages = []
-    for i in range(10):
+    for i in range(55):
         m = Message(
             conversation_id=conv.id,
             sender_id=alice.user_id,
@@ -421,26 +421,40 @@ async def test_message_history_newest_first_and_pagination_limits(
     headers = {"Authorization": f"Bearer {token}"}
 
     # Limit validation: < 1 and > 100 return 422
-    url_0 = f"/conversations/{conv.id}/messages?limit=0"
-    assert (await client.get(url_0, headers=headers)).status_code == 422
-    url_101 = f"/conversations/{conv.id}/messages?limit=101"
-    assert (await client.get(url_101, headers=headers)).status_code == 422
+    assert (
+        await client.get(f"/conversations/{conv.id}/messages?limit=0", headers=headers)
+    ).status_code == 422
+    assert (
+        await client.get(f"/conversations/{conv.id}/messages?limit=-5", headers=headers)
+    ).status_code == 422
+    assert (
+        await client.get(f"/conversations/{conv.id}/messages?limit=101", headers=headers)
+    ).status_code == 422
+    assert (
+        await client.get(f"/conversations/{conv.id}/messages?limit=invalid", headers=headers)
+    ).status_code == 422
 
-    # Default limit returns all 10 messages ordered newest first
+    # Default limit returns default page size of 50 messages ordered newest first
     res = await client.get(f"/conversations/{conv.id}/messages", headers=headers)
     assert res.status_code == 200
     fetched = res.json()
-    assert len(fetched) == 10
-    # Newest message (created at 12:09) is first
-    assert fetched[0]["id"] == str(messages[9].id)
-    assert fetched[9]["id"] == str(messages[0].id)
+    assert len(fetched) == 50
+    # Newest message (created at index 54) is first
+    assert fetched[0]["id"] == str(messages[54].id)
+    assert fetched[49]["id"] == str(messages[5].id)
 
-    # Valid limit parameter
-    res_lim5 = await client.get(
-        f"/conversations/{conv.id}/messages?limit=5", headers=headers
-    )
+    # Explicit limits between 1 and 100
+    res_lim1 = await client.get(f"/conversations/{conv.id}/messages?limit=1", headers=headers)
+    assert res_lim1.status_code == 200
+    assert len(res_lim1.json()) == 1
+
+    res_lim5 = await client.get(f"/conversations/{conv.id}/messages?limit=5", headers=headers)
     assert res_lim5.status_code == 200
     assert len(res_lim5.json()) == 5
+
+    res_lim100 = await client.get(f"/conversations/{conv.id}/messages?limit=100", headers=headers)
+    assert res_lim100.status_code == 200
+    assert len(res_lim100.json()) == 55
 
 
 @pytest.mark.asyncio
@@ -552,24 +566,33 @@ async def test_message_history_identical_timestamps_across_page_boundary(
 async def test_message_history_cursor_validation(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """Ambiguous raw timestamps and malformed cursors return 422; unknown UUID returns 404."""
+    """Malformed UUID, unknown UUID, composite cursor, and other-conversation cursor return 422."""
     alice = await _create_user(db_session, "alice_cursor_val")
     bob = await _create_user(db_session, "bob_cursor_val")
+    charlie = await _create_user(db_session, "charlie_cursor_val")
 
     ua, ub = sorted([alice.user_id, bob.user_id])
     conv = Conversation(user_a_id=ua, user_b_id=ub)
-    db_session.add(conv)
+
+    # Second conversation: alice and charlie
+    ua2, ub2 = sorted([alice.user_id, charlie.user_id])
+    conv_other = Conversation(user_a_id=ua2, user_b_id=ub2)
+
+    db_session.add_all([conv, conv_other])
     await db_session.commit()
+
+    # Message belonging to the other conversation
+    msg_other = Message(
+        conversation_id=conv_other.id,
+        sender_id=alice.user_id,
+        client_msg_id=uuid.uuid4(),
+    )
+    db_session.add(msg_other)
+    await db_session.commit()
+    await db_session.refresh(msg_other)
 
     token = create_access_token(alice.user_id)
     headers = {"Authorization": f"Bearer {token}"}
-
-    # Raw timestamp without message UUID is ambiguous and rejected with 422
-    res_raw_t = await client.get(
-        f"/conversations/{conv.id}/messages?before=2026-11-19T12:00:00Z", headers=headers
-    )
-    assert res_raw_t.status_code == 422
-    assert res_raw_t.json()["detail"] == "invalid_cursor"
 
     # Malformed cursor string rejected with 422
     res_malformed = await client.get(
@@ -578,13 +601,35 @@ async def test_message_history_cursor_validation(
     assert res_malformed.status_code == 422
     assert res_malformed.json()["detail"] == "invalid_cursor"
 
-    # Non-existent UUID cursor returns 404
+    # Raw timestamp without message UUID rejected with 422
+    res_raw_t = await client.get(
+        f"/conversations/{conv.id}/messages?before=2026-11-19T12:00:00Z", headers=headers
+    )
+    assert res_raw_t.status_code == 422
+    assert res_raw_t.json()["detail"] == "invalid_cursor"
+
+    # Composite cursor <timestamp>_<uuid> rejected with 422
+    res_composite = await client.get(
+        f"/conversations/{conv.id}/messages?before=2026-11-19T12:00:00Z_{uuid.uuid4()}",
+        headers=headers,
+    )
+    assert res_composite.status_code == 422
+    assert res_composite.json()["detail"] == "invalid_cursor"
+
+    # Syntactically valid but non-existent (unknown) UUID cursor returns 422
     non_existent = uuid.uuid4()
-    res_404 = await client.get(
+    res_unknown = await client.get(
         f"/conversations/{conv.id}/messages?before={non_existent}", headers=headers
     )
-    assert res_404.status_code == 404
-    assert res_404.json()["detail"] == "cursor_not_found"
+    assert res_unknown.status_code == 422
+    assert res_unknown.json()["detail"] == "invalid_cursor"
+
+    # Cursor message belonging to another conversation returns 422
+    res_wrong_conv = await client.get(
+        f"/conversations/{conv.id}/messages?before={msg_other.id}", headers=headers
+    )
+    assert res_wrong_conv.status_code == 422
+    assert res_wrong_conv.json()["detail"] == "invalid_cursor"
 
 
 

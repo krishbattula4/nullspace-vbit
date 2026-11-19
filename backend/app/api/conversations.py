@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -226,7 +226,7 @@ async def get_message_history(
     id: uuid.UUID,
     current_user: Annotated[User, Depends(get_current_user)],
     session: Annotated[AsyncSession, Depends(get_db)],
-    before: Annotated[str | None, Query(description="Cursor: message ID or timestamp")] = None,
+    before: Annotated[str | None, Query(description="Cursor: message UUID")] = None,
     limit: Annotated[int, Query(ge=1, le=100, description="Page limit (1-100)")] = 50,
 ) -> list[MessageResponse]:
     """Retrieve keyset-paginated message history with nested versions."""
@@ -244,44 +244,34 @@ async def get_message_history(
     # 2. Keyset pagination filter
     stmt = select(Message).where(Message.conversation_id == id)
 
-    if before is not None and before.strip() != "":
-        cursor_str = before.strip()
+    if before is not None:
         try:
-            before_uuid = uuid.UUID(cursor_str)
-            ref_msg = await session.scalar(
-                select(Message).where(
-                    Message.id == before_uuid,
-                    Message.conversation_id == id,
-                )
+            cursor_uuid = uuid.UUID(before.strip())
+        except (ValueError, AttributeError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="invalid_cursor",
+            ) from exc
+
+        ref_msg = await session.scalar(
+            select(Message).where(
+                Message.id == cursor_uuid,
+                Message.conversation_id == id,
             )
-            if ref_msg is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="cursor_not_found",
-                )
-            cursor_created_at = ref_msg.created_at
-            cursor_id = ref_msg.id
-        except ValueError as exc:
-            if "_" in cursor_str:
-                parts = cursor_str.split("_", 1)
-                try:
-                    cursor_created_at = datetime.fromisoformat(parts[0])
-                    cursor_id = uuid.UUID(parts[1])
-                except Exception as inner_exc:
-                    raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        detail="invalid_cursor",
-                    ) from inner_exc
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="invalid_cursor",
-                ) from exc
+        )
+        if ref_msg is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="invalid_cursor",
+            )
 
         stmt = stmt.where(
             or_(
-                Message.created_at < cursor_created_at,
-                (Message.created_at == cursor_created_at) & (Message.id < cursor_id),
+                Message.created_at < ref_msg.created_at,
+                and_(
+                    Message.created_at == ref_msg.created_at,
+                    Message.id < ref_msg.id,
+                ),
             )
         )
 

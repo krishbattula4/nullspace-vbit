@@ -462,8 +462,8 @@ Retrieves keyset-paginated message history for a conversation, ordered newest fi
 
 | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|
-| `before` | string | No | None | Valid message UUID or composite `<iso_timestamp>_<uuid>` | Keyset pagination cursor. Only messages older than this pivot in `(created_at DESC, id DESC)` order are returned. Ambiguous raw timestamps without message UUIDs are rejected. |
-| `limit` | integer | No | 50 | 1 to 100 | Maximum number of messages to return per page. |
+| `before` | string (UUID) | No | None | Valid message UUID | Keyset pagination cursor. The cursor is exclusive; only messages older than the message identified by this cursor in `(created_at DESC, id DESC)` order are returned. Malformed UUIDs, unknown message IDs, or cursor messages belonging to another conversation are rejected with HTTP 422. |
+| `limit` | integer | No | 50 | 1 to 100 | Maximum number of messages to return per page. Defaults to 50. Allowed range is 1 to 100. |
 
 #### Responses
 
@@ -524,7 +524,7 @@ Returned when authentication fails. Detail: `not_authenticated`, `token_expired`
 Returned when the conversation does not exist or the authenticated user is not a participant in the conversation.
 
 > [!IMPORTANT]
-> To prevent conversation enumeration, requesting a conversation where the user is not a participant returns HTTP 404 `conversation_not_found`, never 403. Also returned if a UUID `before` cursor is not found (`cursor_not_found`).
+> To prevent conversation enumeration, requesting a conversation where the user is not a participant returns HTTP 404 `conversation_not_found`, never 403.
 
 **Response Body**:
 ```json
@@ -534,7 +534,17 @@ Returned when the conversation does not exist or the authenticated user is not a
 ```
 
 ##### 422 Unprocessable Entity
-Returned when `limit` is outside the allowed range (1 to 100) or path/query parameters are invalid.
+Returned when request parameters fail validation:
+- `before` is malformed (not a valid UUID), syntactically valid but unknown in the database, or refers to a message from another conversation (`invalid_cursor`).
+- `limit` is outside the allowed range of 1 to 100 or is not a valid integer.
+- Path parameters fail schema validation.
+
+**Example Response Body**:
+```json
+{
+  "detail": "invalid_cursor"
+}
+```
 
 ---
 
