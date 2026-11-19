@@ -316,6 +316,41 @@ If authentication fails, the server closes the WebSocket connection with code `4
 
 **Rationale**: URLs and query strings are routinely recorded in plain text across web server access logs, reverse proxy logs, application performance traces, error monitoring dashboards, and browser navigation histories. Placing sensitive Bearer tokens in URLs causes credentials to leak across logging infrastructure. Nullspace strictly ignores query parameter tokens and mandates that authentication occurs over the established WebSocket channel via the encrypted TLS tunnel.
 
+## Heartbeat
+
+WebSocket connections use periodic heartbeat ping/pong frames to detect stale or broken network connections, enforce idle timeouts, and maintain socket health.
+
+### Keepalive flow
+
+1. **Heartbeat Task**: Only after `AUTH_OK` has been sent successfully, the server starts a dedicated heartbeat task for the connection.
+2. **Server PING**: The server sends a PING frame every 30 seconds (`HEARTBEAT_INTERVAL_SECONDS = 30.0`):
+   ```json
+   {
+     "type": "PING"
+   }
+   ```
+3. **Client PONG**: The client responds to server PING with a PONG frame:
+   ```json
+   {
+     "type": "PONG"
+   }
+   ```
+4. **Client PING**: If the client sends a `{"type": "PING"}` frame, the server responds immediately with `{"type": "PONG"}`.
+5. **Activity Refresh**: Any received frame from the client (PING, PONG, or data payload) refreshes the connection's `last_seen` timestamp in the connection registry (`registry.touch`).
+6. **Inactivity Timeout**: Connections that remain inactive for 60 seconds (`HEARTBEAT_TIMEOUT_SECONDS = 60.0`) without receiving any frame are closed.
+
+### Lifecycle close codes
+
+| Close Code | Reason String | Condition |
+|---|---|---|
+| `4401` | `"auth_timeout"`, `"token_expired"`, `"invalid_token"` | Initial authentication handshake failed or timed out. |
+| `4408` | `"heartbeat_timeout"` | Inactive connection; no frame was received within 60 seconds (`HEARTBEAT_TIMEOUT_SECONDS`). |
+| `1009` | `"message_too_big"` | Incoming message exceeded `max_message_bytes` (65,536 bytes / 64 KiB). |
+| `1011` | `"internal_error"` | Unexpected server-side error encountered during connection processing. |
+| `1000` | Normal closure | Connection closed cleanly by client or server. |
+
+When a connection closes or disconnects under any condition, the server cancels and awaits the connection's heartbeat task, removes the socket cleanly from the registry, and cleans up the user's entry when no sockets remain.
+
 ## Client key storage
 
 The client persists Signal Protocol state locally using browser IndexedDB via `IndexedDBSignalStore`. Each user account uses an isolated database named:
