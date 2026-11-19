@@ -8,7 +8,12 @@ export default defineConfig({
   resolve: {
     alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
   },
-  server: { port: 5173 },
+  server: {
+    port: 5173,
+    fs: {
+      allow: [".."],
+    },
+  },
   test: {
     environment: "node",
     setupFiles: ["./src/test/setup.ts"],

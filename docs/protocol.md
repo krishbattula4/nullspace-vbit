@@ -1,4 +1,4 @@
-# Wire protocol (draft, completed in task P2.2)
+# Wire protocol
 
 All WebSocket frames are JSON objects with a `v` (protocol version, currently 1) and a `type`.
 Message bodies are **always ciphertext**: base64 of the libsignal output, with `ctype` 3 (`PreKeyWhisperMessage`) or 1 (`WhisperMessage`).
@@ -22,19 +22,257 @@ type CipherEnvelope = {
 - **`ctype`**: Mapped directly from `CipherEnvelope.type` (`3` for initial handshake message establishing the session, `1` for subsequent ratcheted messages).
 - **`body`**: Mapped directly from `CipherEnvelope.body` (standard base64 string derived from raw binary cipher bytes).
 
+### Protocol Rules & Validation
 
-| type | direction | fields | notes |
-|---|---|---|---|
-| MESSAGE | client -> server -> recipient | conversation_id, client_msg_id, ctype, body | server assigns message_id and version 1 |
-| ACK | server -> sender | client_msg_id, message_id, status | status SENT or QUEUED |
-| DELIVERED | recipient -> server -> sender | message_id | sets delivered_at |
-| READ | recipient -> server -> sender | message_id | sets read_at (P5.1) |
-| EDIT | client -> server -> recipient | message_id, ctype, body | new version, action EDIT |
-| DELETE | client -> server -> both | message_id | allowed only before read; ciphertext erased |
-| RETRACT | client -> server -> both | message_id | after read; ciphertext kept, bubble collapsed |
-| TYPING | client -> server -> recipient | conversation_id | throttled, never stored |
-| PRESENCE | server -> contacts | user_id, online | first connect / last disconnect only |
-| KEY_CHANGED | client-side event | user_id | raised when a contact's identity key differs from the trusted one |
+- **Protocol Version**: `PROTOCOL_VERSION = 1`. Every WebSocket data frame must carry integer `"v": 1`.
+- **Version Policy**: An unknown `v` is rejected with an ERROR frame carrying code `unsupported_version` and the connection stays open; the sender must upgrade.
+- **Control Frames Exception**: Control frames carry NO `v` property: `AUTH`, `AUTH_OK`, `PING`, `PONG`.
+- **Field Rules**:
+  - **UUID**: Canonical lowercase hyphenated UUID strings matching `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`. Uppercase and non-hyphenated strings are rejected.
+  - **`ctype`**: Strictly integer `1` (`WhisperMessage`) or `3` (`PreKeyWhisperMessage`). Any other integer or type is rejected.
+  - **`body`**: Standard-alphabet base64 with correct padding, non-empty, decoded size at most `MAX_BODY_BYTES = 65536` bytes (base64 text at most 87384 characters). Non-canonical padding is rejected.
+  - **Timestamps**: ISO 8601 UTC strings ending in `Z` (e.g. `2026-11-18T12:00:00Z`).
+  - **Strict Schemas**: Unknown extra fields are rejected on both client and server frames.
+- **Client-Side Event**: `KEY_CHANGED` is a CLIENT-SIDE event only (raised when a contact's identity key differs). It never travels over the wire: the backend must reject it as `unknown_type`; the TypeScript side defines its type `{type:"KEY_CHANGED", user_id}` for the UI event bus only.
+
+### Client -> Server Frames (all need v)
+
+1. **`MESSAGE`**: Transmits an end-to-end encrypted message.
+   - Fields: `conversation_id`, `client_msg_id`, `ctype`, `body`
+   ```json
+   {
+     "v": 1,
+     "type": "MESSAGE",
+     "conversation_id": "11111111-1111-1111-1111-111111111111",
+     "client_msg_id": "22222222-2222-2222-2222-222222222222",
+     "ctype": 1,
+     "body": "AQID"
+   }
+   ```
+
+2. **`DELIVERED`**: Recipient confirms receipt of message ciphertext.
+   - Fields: `message_id`
+   ```json
+   {
+     "v": 1,
+     "type": "DELIVERED",
+     "message_id": "44444444-4444-4444-4444-444444444444"
+   }
+   ```
+
+3. **`READ`**: Recipient confirms user has read the message.
+   - Fields: `message_id`
+   ```json
+   {
+     "v": 1,
+     "type": "READ",
+     "message_id": "44444444-4444-4444-4444-444444444444"
+   }
+   ```
+
+4. **`EDIT`**: Sender publishes a newly encrypted revision of an existing message.
+   - Fields: `message_id`, `ctype`, `body`
+   ```json
+   {
+     "v": 1,
+     "type": "EDIT",
+     "message_id": "44444444-4444-4444-4444-444444444444",
+     "ctype": 1,
+     "body": "BAUG"
+   }
+   ```
+
+5. **`DELETE`**: Sender deletes message prior to read (ciphertext erased on server).
+   - Fields: `message_id`
+   ```json
+   {
+     "v": 1,
+     "type": "DELETE",
+     "message_id": "44444444-4444-4444-4444-444444444444"
+   }
+   ```
+
+6. **`RETRACT`**: Sender retracts message after read (ciphertext preserved, bubble collapsed).
+   - Fields: `message_id`
+   ```json
+   {
+     "v": 1,
+     "type": "RETRACT",
+     "message_id": "44444444-4444-4444-4444-444444444444"
+   }
+   ```
+
+7. **`TYPING`**: Ephemeral typing indicator for a conversation.
+   - Fields: `conversation_id`
+   ```json
+   {
+     "v": 1,
+     "type": "TYPING",
+     "conversation_id": "11111111-1111-1111-1111-111111111111"
+   }
+   ```
+
+### Server -> Client Frames (all need v)
+
+1. **`MESSAGE`**: Relayed ciphertext message with assigned ID and metadata.
+   - Fields: `message_id`, `conversation_id`, `sender_id`, `version_no` (int >= 1), `ctype`, `body`, `created_at`
+   ```json
+   {
+     "v": 1,
+     "type": "MESSAGE",
+     "message_id": "44444444-4444-4444-4444-444444444444",
+     "conversation_id": "11111111-1111-1111-1111-111111111111",
+     "sender_id": "55555555-5555-5555-5555-555555555555",
+     "version_no": 1,
+     "ctype": 1,
+     "body": "AQID",
+     "created_at": "2026-11-18T12:00:00Z"
+   }
+   ```
+
+2. **`ACK`**: Server acknowledgment confirming receipt and routing status of a sent message.
+   - Fields: `client_msg_id`, `message_id`, `status` (`"SENT"` or `"QUEUED"`)
+   ```json
+   {
+     "v": 1,
+     "type": "ACK",
+     "client_msg_id": "22222222-2222-2222-2222-222222222222",
+     "message_id": "44444444-4444-4444-4444-444444444444",
+     "status": "SENT"
+   }
+   ```
+
+3. **`DELIVERED`**: Delivery notification relayed to the sender.
+   - Fields: `message_id`, `delivered_at`
+   ```json
+   {
+     "v": 1,
+     "type": "DELIVERED",
+     "message_id": "44444444-4444-4444-4444-444444444444",
+     "delivered_at": "2026-11-18T12:00:05Z"
+   }
+   ```
+
+4. **`READ`**: Read receipt relayed to the sender.
+   - Fields: `message_id`, `read_at`
+   ```json
+   {
+     "v": 1,
+     "type": "READ",
+     "message_id": "44444444-4444-4444-4444-444444444444",
+     "read_at": "2026-11-18T12:00:10Z"
+   }
+   ```
+
+5. **`EDIT`**: Relayed edited version of a message.
+   - Fields: `message_id`, `version_no` (int >= 2), `ctype`, `body`, `edited_at`
+   ```json
+   {
+     "v": 1,
+     "type": "EDIT",
+     "message_id": "44444444-4444-4444-4444-444444444444",
+     "version_no": 2,
+     "ctype": 1,
+     "body": "BAUG",
+     "edited_at": "2026-11-18T12:00:15Z"
+   }
+   ```
+
+6. **`DELETE`**: Relayed message deletion broadcast.
+   - Fields: `message_id`
+   ```json
+   {
+     "v": 1,
+     "type": "DELETE",
+     "message_id": "44444444-4444-4444-4444-444444444444"
+   }
+   ```
+
+7. **`RETRACT`**: Relayed message retraction broadcast.
+   - Fields: `message_id`
+   ```json
+   {
+     "v": 1,
+     "type": "RETRACT",
+     "message_id": "44444444-4444-4444-4444-444444444444"
+   }
+   ```
+
+8. **`TYPING`**: Relayed ephemeral typing event.
+   - Fields: `conversation_id`, `user_id`
+   ```json
+   {
+     "v": 1,
+     "type": "TYPING",
+     "conversation_id": "11111111-1111-1111-1111-111111111111",
+     "user_id": "55555555-5555-5555-5555-555555555555"
+   }
+   ```
+
+9. **`PRESENCE`**: Contact online / offline state change.
+   - Fields: `user_id`, `online` (boolean)
+   ```json
+   {
+     "v": 1,
+     "type": "PRESENCE",
+     "user_id": "55555555-5555-5555-5555-555555555555",
+     "online": true
+   }
+   ```
+
+10. **`ERROR`**: Server error frame for rejected messages or parser failures.
+    - Fields: `code` (string), `detail` (string, optional), `client_msg_id` (UUID, optional)
+    ```json
+    {
+      "v": 1,
+      "type": "ERROR",
+      "code": "invalid_frame",
+      "detail": "bad UUID",
+      "client_msg_id": "22222222-2222-2222-2222-222222222222"
+    }
+    ```
+
+### Control Frames (no v)
+
+- **`AUTH`** (client -> server): Handshake authentication frame sent within 5 seconds of connection.
+  ```json
+  {
+    "type": "AUTH",
+    "token": "<access token>"
+  }
+  ```
+- **`AUTH_OK`** (server -> client): Handshake acknowledgment confirming connection registration.
+  ```json
+  {
+    "type": "AUTH_OK",
+    "user_id": "55555555-5555-5555-5555-555555555555"
+  }
+  ```
+- **`PING`**: Heartbeat probe frame.
+  ```json
+  {
+    "type": "PING"
+  }
+  ```
+- **`PONG`**: Heartbeat response frame.
+  ```json
+  {
+    "type": "PONG"
+  }
+  ```
+
+### Parser Error Codes
+
+When a received WebSocket data frame violates protocol rules, the server generates an `ERROR` frame with one of the following canonical error codes:
+
+| Error Code | Meaning |
+|---|---|
+| `invalid_json` | The payload text is not valid JSON. |
+| `not_an_object` | The JSON payload is not a JSON object (e.g. array, primitive, null). |
+| `missing_version` | The `"v"` field is missing from a data frame. |
+| `unsupported_version` | The `"v"` field is not an integer, is a boolean, or is not equal to `1`. |
+| `unknown_type` | The `"type"` field is unrecognized, server-only frame sent by client, or control/client-only frame sent as data frame. |
+| `invalid_frame` | One or more fields failed validation (e.g. non-canonical UUID, invalid ctype, invalid base64, decoded payload > 65536 bytes, non-canonical padding, extra unknown fields). |
 
 REST (HTTPS) is used for one-shot operations: `/auth/*`, `/keys/*`, `/conversations/*`, `/media/*`, `/me/audit`.
 
