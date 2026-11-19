@@ -20,6 +20,16 @@ import {
   MessagePayloadError,
 } from "./messagePayload";
 import { classifyDecryptError } from "./decryptErrors";
+import type { ServerHistoryMessage, ServerHistoryVersion } from "../lib/history";
+
+export interface ReconcileResult {
+  decrypted: number;
+  tombstones: number;
+  retracted: number;
+  statusUpdates: number;
+  failures: number;
+  confirmedSends: number;
+}
 
 export type MessageActionErrorCode =
   | "not_found"
@@ -49,7 +59,8 @@ export type SecureMessengerEvent =
   | "update"
   | "decryptFailed"
   | "orphanEvent"
-  | "protocolError";
+  | "protocolError"
+  | "synced";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- event data carries varying payload structures
 export type SecureMessengerEventHandler = (data?: any) => void | Promise<void>;
@@ -73,6 +84,22 @@ export class SecureMessenger {
 
   private peerLocks = new Map<string, Promise<void>>();
   private listeners = new Map<SecureMessengerEvent, Set<SecureMessengerEventHandler>>();
+  private lastMicros = 0;
+
+  /**
+   * Local timestamps for messages and versions THIS device creates. They are strictly
+   * increasing with microsecond precision (6 fraction digits, same format as the server's),
+   * even when two messages are created in the same millisecond or the system clock jumps
+   * backwards. Without this, messages created at the same instant tie on createdAt and are
+   * then ordered by their random id, so quickly sent messages could appear out of order.
+   */
+  private nextCreatedAt(): string {
+    const micros = Math.max(this.now().getTime() * 1000, this.lastMicros + 1);
+    this.lastMicros = micros;
+    const iso = new Date(Math.floor(micros / 1000)).toISOString(); // YYYY-MM-DDTHH:mm:ss.sssZ
+    const extra = String(micros % 1000).padStart(3, "0");
+    return `${iso.slice(0, 23)}${extra}Z`;
+  }
 
   constructor(options: SecureMessengerOptions) {
     this.userId = options.userId;
@@ -122,6 +149,10 @@ export class SecureMessenger {
   on(
     event: "protocolError",
     handler: (data: { code: string; detail?: string }) => void | Promise<void>,
+  ): () => void;
+  on(
+    event: "synced",
+    handler: (data: ReconcileResult) => void | Promise<void>,
   ): () => void;
   on(
     event: SecureMessengerEvent,
@@ -228,7 +259,7 @@ export class SecureMessenger {
       // a. clientMsgId = newId(); plaintext = encodeMessagePayload(payload)
       const clientMsgId = this.newId();
       const plaintext = encodeMessagePayload(payload);
-      const createdAt = this.now().toISOString();
+      const createdAt = this.nextCreatedAt();
 
       // b. Save the outgoing message locally FIRST: messages.putMessage(...) and messages.addVersion(...)
       const outgoingMsg: MessageRecord = {
@@ -411,7 +442,7 @@ export class SecureMessenger {
       const currentVersions = await this.messages.getVersions(messageId);
       const maxVer = currentVersions.reduce((max, v) => Math.max(max, v.versionNo), 0);
       const versionNo = maxVer + 1;
-      const createdAt = this.now().toISOString();
+      const createdAt = this.nextCreatedAt();
 
       await this.messages.addVersion({
         messageId,
@@ -611,6 +642,331 @@ export class SecureMessenger {
     });
 
     return records;
+  }
+
+  async reconcileHistory(
+    peerId: string,
+    messages: ServerHistoryMessage[],
+  ): Promise<ReconcileResult> {
+    const result: ReconcileResult = {
+      decrypted: 0,
+      tombstones: 0,
+      retracted: 0,
+      statusUpdates: 0,
+      failures: 0,
+      confirmedSends: 0,
+    };
+
+    try {
+      await this.withPeerLock(peerId, async () => {
+        const changedMessageIds = new Set<string>();
+
+        // a. LOST ACK REPAIR:
+        // for each server message whose senderId is THIS user and which has no local record under its server id:
+        // look up messages.getByClientMsgId(clientMsgId). If a local record exists (a temporary record),
+        // call messages.confirmSent(clientMsgId, { messageId: serverId, status, createdAt }) and count it in confirmedSends.
+        for (const m of messages) {
+          if (m.senderId === this.userId) {
+            const localRecord = await this.messages.getMessage(m.id);
+            if (!localRecord && m.clientMsgId) {
+              const tempRecord = await this.messages.getByClientMsgId(m.clientMsgId);
+              if (tempRecord) {
+                await this.messages.confirmSent(m.clientMsgId, {
+                  messageId: m.id,
+                  status: m.status,
+                  createdAt: m.createdAt,
+                });
+                result.confirmedSends++;
+                changedMessageIds.add(m.id);
+              }
+            }
+          }
+        }
+
+        // b. OWN MESSAGES that are still missing locally:
+        // (for example the user cleared site data): you cannot decrypt your own ciphertext.
+        // Store a placeholder record: putMessage({ id, conversationId, senderId, clientMsgId, createdAt,
+        // status mapped from the server, currentVersion, decryptFailed: true, decryptErrorCode: "own_unavailable" })
+        // and store NO ciphertext and NO failed envelope. Never call decrypt for your own messages.
+        // Still apply the deleted, retracted and status rules below to them.
+        for (const m of messages) {
+          if (m.senderId === this.userId) {
+            const localRecord = await this.messages.getMessage(m.id);
+            if (!localRecord) {
+              await this.messages.putMessage({
+                id: m.id,
+                conversationId: m.conversationId,
+                senderId: m.senderId,
+                clientMsgId: m.clientMsgId ?? undefined,
+                createdAt: m.createdAt,
+                status: m.status,
+                currentVersion: m.currentVersion,
+                decryptFailed: true,
+                decryptErrorCode: "own_unavailable",
+              });
+              changedMessageIds.add(m.id);
+            }
+          }
+        }
+
+        // c. PEER MESSAGES, collect the work list:
+        // for every message authored by the peer, every version whose action is CREATE or EDIT,
+        // whose ciphertext is non-empty and erasedAt is null, and which is MISSING locally (no stored version with that number)
+        // and whose message is not already marked deleted locally; skip versions of a message that has a failed envelope
+        // or decryptFailed flag from the live path (retryDecrypt owns those) and skip versions of a message the server reports as deleted.
+        interface WorkItem {
+          serverMsg: ServerHistoryMessage;
+          version: ServerHistoryVersion;
+        }
+        const workList: WorkItem[] = [];
+
+        for (const m of messages) {
+          if (m.senderId !== this.userId) {
+            const isServerDeleted = m.versions.some(
+              (v) => v.action === "DELETE" || v.erasedAt !== null,
+            );
+            if (isServerDeleted) continue;
+
+            const localMsg = await this.messages.getMessage(m.id);
+            if (localMsg && localMsg.deletedAt) continue;
+
+            const existingFailedEnvelope = await this.messages.getFailedEnvelope(m.id);
+            // Skip versions of a message that has a failed envelope or decryptFailed flag from the live path
+            if (localMsg && localMsg.decryptFailed && localMsg.decryptErrorCode !== "own_unavailable") {
+              continue;
+            }
+            if (existingFailedEnvelope) {
+              continue;
+            }
+
+            const storedVersions = await this.messages.getVersions(m.id);
+            const storedVersionNos = new Set(storedVersions.map((v) => v.versionNo));
+
+            for (const v of m.versions) {
+              if (
+                (v.action === "CREATE" || v.action === "EDIT") &&
+                v.ciphertext !== "" &&
+                v.erasedAt === null
+              ) {
+                if (!storedVersionNos.has(v.versionNo)) {
+                  workList.push({ serverMsg: m, version: v });
+                }
+              }
+            }
+          }
+        }
+
+        // Sort the whole work list by (version.createdAt ascending, version.id ascending) across ALL messages,
+        // because the Double Ratchet must decrypt in the order the sender encrypted.
+        workList.sort((a, b) => {
+          const timeCmp = a.version.createdAt.localeCompare(b.version.createdAt);
+          if (timeCmp !== 0) return timeCmp;
+          return a.version.id.localeCompare(b.version.id);
+        });
+
+        const failedMessageIds = new Set<string>();
+
+        // Then process sequentially:
+        for (const { serverMsg, version } of workList) {
+          if (failedMessageIds.has(serverMsg.id)) {
+            continue;
+          }
+          try {
+            const plaintext = await this.sessions.decrypt(peerId, {
+              type: version.ctype,
+              body: version.ciphertext,
+            });
+            const payload = decodeMessagePayload(plaintext);
+
+            if (version.action === "CREATE") {
+              const localRecord = await this.messages.getMessage(serverMsg.id);
+              if (!localRecord) {
+                await this.messages.putMessage({
+                  id: serverMsg.id,
+                  conversationId: serverMsg.conversationId,
+                  senderId: serverMsg.senderId,
+                  clientMsgId: serverMsg.clientMsgId ?? undefined,
+                  createdAt: serverMsg.createdAt,
+                  status: "DELIVERED",
+                  currentVersion: serverMsg.currentVersion,
+                });
+              }
+              await this.messages.addVersion({
+                messageId: serverMsg.id,
+                versionNo: version.versionNo,
+                plaintext,
+                action: "CREATE",
+                createdAt: version.createdAt,
+              });
+              result.decrypted++;
+              changedMessageIds.add(serverMsg.id);
+            } else {
+              // EDIT
+              if (payload.type !== "TEXT") {
+                throw new MessagePayloadError("EDIT payload must be TEXT");
+              }
+              await this.messages.addVersion({
+                messageId: serverMsg.id,
+                versionNo: version.versionNo,
+                plaintext,
+                action: "EDIT",
+                createdAt: version.createdAt,
+              });
+              const currentMsg = await this.messages.getMessage(serverMsg.id);
+              if (currentMsg && (currentMsg.currentVersion ?? 0) < version.versionNo) {
+                currentMsg.currentVersion = version.versionNo;
+                await this.messages.putMessage(currentMsg);
+              }
+              result.decrypted++;
+              changedMessageIds.add(serverMsg.id);
+            }
+          } catch (err) {
+            result.failures++;
+            const code = classifyDecryptError(err);
+            if (version.action === "CREATE") {
+              failedMessageIds.add(serverMsg.id);
+              await this.messages.saveFailedEnvelope({
+                messageId: serverMsg.id,
+                conversationId: serverMsg.conversationId,
+                senderId: serverMsg.senderId,
+                ctype: version.ctype,
+                body: version.ciphertext,
+                receivedAt: version.createdAt,
+                attempts: 1,
+                lastErrorCode: code,
+              });
+              const localRecord = await this.messages.getMessage(serverMsg.id);
+              if (!localRecord) {
+                await this.messages.putMessage({
+                  id: serverMsg.id,
+                  conversationId: serverMsg.conversationId,
+                  senderId: serverMsg.senderId,
+                  clientMsgId: serverMsg.clientMsgId ?? undefined,
+                  createdAt: serverMsg.createdAt,
+                  status: "DELIVERED",
+                  currentVersion: serverMsg.currentVersion,
+                  decryptFailed: true,
+                  decryptErrorCode: code,
+                });
+              } else {
+                await this.messages.markDecryptFailed(serverMsg.id, true, code);
+              }
+              this.emit("decryptFailed", {
+                messageId: serverMsg.id,
+                conversationId: serverMsg.conversationId,
+                senderId: serverMsg.senderId,
+                code,
+                error: err,
+              });
+              changedMessageIds.add(serverMsg.id);
+            } else {
+              this.emit("decryptFailed", {
+                messageId: serverMsg.id,
+                kind: "EDIT",
+                versionNo: version.versionNo,
+                code,
+                error: err,
+              });
+            }
+          }
+        }
+
+        // d. DELETIONS:
+        // if the server shows a version with action DELETE (or any version with erasedAt set)
+        // and the local message is not deleted: markDeleted(id, { at: that DELETE version's createdAt, by: its actorId }).
+        // If the message does not exist locally, first putMessage a tombstone-only record (no versions) then markDeleted.
+        // Count in tombstones. Never decrypt or store text for a deleted message.
+        for (const m of messages) {
+          const delVersion =
+            m.versions.find((v) => v.action === "DELETE") ??
+            m.versions.find((v) => v.erasedAt !== null);
+
+          if (delVersion) {
+            const local = await this.messages.getMessage(m.id);
+            if (!local) {
+              await this.messages.putMessage({
+                id: m.id,
+                conversationId: m.conversationId,
+                senderId: m.senderId,
+                clientMsgId: m.clientMsgId ?? undefined,
+                createdAt: m.createdAt,
+                status: m.status,
+                currentVersion: m.currentVersion,
+              });
+              await this.messages.markDeleted(m.id, {
+                at: delVersion.createdAt,
+                by: delVersion.actorId,
+              });
+              result.tombstones++;
+              changedMessageIds.add(m.id);
+            } else if (!local.deletedAt) {
+              await this.messages.markDeleted(m.id, {
+                at: delVersion.createdAt,
+                by: delVersion.actorId,
+              });
+              result.tombstones++;
+              changedMessageIds.add(m.id);
+            }
+          }
+        }
+
+        // e. RETRACTIONS:
+        // if the server shows a RETRACT version and the local message is not retracted and not deleted:
+        // markRetracted(id, { at, by }) AFTER its ciphertext versions were processed in step c. Count in retracted.
+        for (const m of messages) {
+          const retractVersion = m.versions.find((v) => v.action === "RETRACT");
+          if (retractVersion) {
+            const local = await this.messages.getMessage(m.id);
+            if (local && !local.retractedAt && !local.deletedAt) {
+              await this.messages.markRetracted(m.id, {
+                at: retractVersion.createdAt,
+                by: retractVersion.actorId,
+              });
+              result.retracted++;
+              changedMessageIds.add(m.id);
+            }
+          }
+        }
+
+        // f. STATUS (only for messages authored by THIS user):
+        // readAt not null -> setStatus READ; else deliveredAt not null or server status DELIVERED -> DELIVERED;
+        // else server status QUEUED -> QUEUED, SENT -> SENT. setStatus never moves backward, so repeating is safe.
+        // Count real changes in statusUpdates.
+        for (const m of messages) {
+          if (m.senderId === this.userId) {
+            let targetStatus: MessageStatus;
+            if (m.readAt !== null) {
+              targetStatus = "READ";
+            } else if (m.deliveredAt !== null || m.status === "DELIVERED") {
+              targetStatus = "DELIVERED";
+            } else if (m.status === "QUEUED") {
+              targetStatus = "QUEUED";
+            } else {
+              targetStatus = "SENT";
+            }
+
+            // setStatus resolves to the final status (or undefined for an unknown id) and never
+            // moves a status backward, so only count a REAL change.
+            const before = (await this.messages.getMessage(m.id))?.status;
+            const updated = await this.messages.setStatus(m.id, targetStatus);
+            if (updated !== undefined && updated !== before) {
+              result.statusUpdates++;
+              changedMessageIds.add(m.id);
+            }
+          }
+        }
+
+        // g. Emit one "update" event per message that changed and one "synced" event with the ReconcileResult.
+        for (const id of changedMessageIds) {
+          this.emit("update", { messageId: id });
+        }
+        this.emit("synced", result);
+      });
+    } catch {
+      // reconcileHistory never throws
+    }
+
+    return result;
   }
 
   async onServerFrame(frame: ServerFrame): Promise<void> {

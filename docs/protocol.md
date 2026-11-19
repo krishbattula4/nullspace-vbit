@@ -649,3 +649,61 @@ Message modification and revocation frames are defined in the Nullspace wire pro
 7. **Orphan & Protocol Error Containment**:
    - `EDIT`, `DELETE`, or `RETRACT` frames received for unknown message IDs do not throw or corrupt local state; they emit `orphanEvent` with `{ kind, messageId }`.
    - Server `ERROR` frames lacking a `client_msg_id` correlate to connection-level or protocol errors and emit `protocolError` with `{ code, message }` without throwing.
+
+## History reconciliation
+
+Nullspace uses an end-to-end encrypted history reconciliation protocol to bring the client's local IndexedDB store into synchronization with the server after being offline, upon WebSocket reconnection, or following message-action orphans.
+
+### Triggers
+
+Reconciliation is triggered by the client in three situations:
+1. **Conversation Open**: When the user opens or switches to a conversation.
+2. **WebSocket Reconnect**: When the WebSocket connection transitions back to `OPEN` after a disconnection.
+3. **Orphan Event Handling**: When an `orphanEvent` is raised (e.g. receiving a `DELETE`, `RETRACT`, or `EDIT` frame for a message not yet known locally).
+
+### Reconciliation Algorithm
+
+Reconciliation executes inside the per-peer mutex lock (`withPeerLock(peerId)`), ensuring strictly serialized state transitions with concurrent live WebSocket traffic. The sync runner retrieves server history using keyset pagination (`GET /conversations/{id}/messages?limit=50&before=<id>`) and processes the aggregated messages through the following stages:
+
+1. **Lost ACK Repair**:
+   - Outgoing messages sent immediately prior to disconnection may have a local `SENDING` record keyed by `clientMsgId`.
+   - The engine checks server messages where `senderId === userId` and `clientMsgId` matches a local `SENDING` record.
+   - It re-keys the temporary record to the server's canonical UUID via `confirmSent(clientMsgId, serverId, createdAt)`.
+
+2. **Own-Message Recovery Limits & Placeholders**:
+   - Because the Signal Protocol enforces strict forward secrecy and ratchets sending keys forward immediately upon encryption, sending keys are never stored. A client **cannot decrypt its own sent ciphertexts** if the local record was wiped or lost.
+   - For server messages authored by this user that do not exist locally, the engine stores a placeholder `MessageRecord` with `decryptFailed: true` and `decryptErrorCode: "own_unavailable"`.
+   - Any server tombstones (`DELETE`) or retractions (`RETRACT`) on own messages are applied directly to the placeholder.
+
+3. **Global Chronological Ratchet Decryption**:
+   - For peer-authored messages, missing versions (`CREATE` or `EDIT`) with non-empty ciphertext and null `erasedAt` are collected into a unified work list.
+   - Messages already marked `deletedAt` locally, messages with existing `failedEnvelopes` (owned by `retryDecrypt`), or messages already marked `decryptFailed` (except `"own_unavailable"`) are excluded.
+   - **Critical Ordering**: The work list is sorted globally across all messages by `(version.createdAt ASC, version.id ASC)`. Because the Signal Double Ratchet requires sequential decryption in the exact order the sender encrypted, all interleaved creates and edits across different conversations or threads must be decrypted chronologically.
+   - Processing sequentially:
+     - On successful decrypt: `CREATE` stores the base message and version 1; `EDIT` appends version $n$ and updates `currentVersion`.
+     - On decrypt failure: `classifyDecryptError` categorizes the failure. A failed `CREATE` stores a `failedEnvelope`, marks the message `decryptFailed`, emits `decryptFailed`, and skips subsequent versions of that message. A failed `EDIT` emits `decryptFailed` with `{ kind: "EDIT", versionNo }` without storing the version.
+
+4. **Merge by Version Number (Never by Time)**:
+   - Edits are identified and merged strictly by `versionNo` ascending, never by timestamp.
+   - Local clocks can drift or skew arbitrarily between peers; version sequences provide monotonic total ordering for each message's lifecycle.
+
+5. **Tombstones & Retractions**:
+   - Deletions: If any server version indicates `action === "DELETE"` or `erasedAt !== null`, `markDeleted` is called to erase plaintexts across all local versions and leave a tombstone.
+   - Retractions: If any server version indicates `action === "RETRACT"`, `markRetracted` is called on the local record.
+
+6. **Status Alignment**:
+   - For own messages, server delivery and read receipts update local status monotonically:
+     - `readAt !== null` -> `READ`
+     - `deliveredAt !== null` or `status === "DELIVERED"` -> `DELIVERED`
+     - Server `QUEUED` -> `QUEUED`, `SENT` -> `SENT`.
+   - `setStatus` never moves status backward (e.g. `READ` is never downgraded to `DELIVERED`).
+
+7. **Event Notification**:
+   - The engine tracks all mutated message IDs and emits one `"update"` event per changed message, followed by a final `"synced"` event containing the `ReconcileResult` (`decrypted`, `tombstones`, `retracted`, `statusUpdates`, `failures`).
+
+### Paging, Windows & Scalability Limits
+
+- **Keyset Pagination**: Traversed backwards from newest to oldest using `limit` and `before`.
+- **Sync Limits**: Routine background sync retrieves up to `MAX_ROUTINE_MESSAGES = 500`. Explicit deep syncs cap at `MAX_TOTAL_MESSAGES = 10,000`.
+- **All-or-Nothing Safety**: If any page request fails (network error, HTTP 500, invalid JSON), the entire sync aborts cleanly returning `{ status: "skipped" }` without partially mutating the local store or corrupting the ratchet.
+- **Future Delta Endpoint**: To eliminate linear keyset scanning over large histories, a future server enhancement should provide a `GET /conversations/{id}/messages/delta?since_version=...` endpoint returning only revisions modified since the client's last synchronized state (`historyState.lastSyncAt`).
