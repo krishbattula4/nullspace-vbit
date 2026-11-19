@@ -600,3 +600,52 @@ In accordance with Section 4 of `docs/threat-model.md`, when a message is marked
 1. All versions in the `versions` store have their `plaintext` wiped to `""`.
 2. Any corresponding record in `failedEnvelopes` is permanently deleted (`deleteFailedEnvelope(id)`).
 **Rule**: The raw ciphertext of a deleted message must not stay on the user's device.
+
+## Edit, delete and retract (client side)
+
+### Wire Formats
+
+Message modification and revocation frames are defined in the Nullspace wire protocol:
+
+- **Outgoing Client Frames** (built via `frontend/src/lib/protocol.ts`):
+  - `EDIT`: `{ v: 1, type: "EDIT", message_id: UUID, ctype: 1 | 3, body: string }`
+  - `DELETE`: `{ v: 1, type: "DELETE", message_id: UUID }`
+  - `RETRACT`: `{ v: 1, type: "RETRACT", message_id: UUID }`
+- **Incoming Server Frames**:
+  - `EDIT`: `{ v: 1, type: "EDIT", message_id: UUID, version_no: number, ctype: 1 | 3, body: string, edited_at: ISO }` (pushed to recipient only; sender does not receive an echo)
+  - `DELETE`: `{ v: 1, type: "DELETE", message_id: UUID }` (pushed to both sender and recipient)
+  - `RETRACT`: `{ v: 1, type: "RETRACT", message_id: UUID }` (pushed to both sender and recipient)
+  - `DELIVERED`: `{ v: 1, type: "DELIVERED", message_id: UUID, delivered_at: ISO }`
+  - `READ`: `{ v: 1, type: "READ", message_id: UUID, read_at: ISO }`
+
+### Authority & Pre-conditions
+
+- **Original Sender Only**: Only the author (`message.senderId === messenger.userId`) has authority to edit, delete, or retract a message. Attempts by the peer to modify a message fail validation locally (`not_sender`) and are rejected.
+- **Pre-condition Validation (`canEdit`, `canDelete`, `canRetract`)**:
+  - All three checks query local IndexedDB storage and enforce:
+    1. Message must exist locally (`not_found`).
+    2. Current user must be the sender (`not_sender`).
+    3. Status cannot be `SENDING` or `FAILED` without server confirmation (`not_confirmed`).
+    4. If already deleted (`deletedAt != null`), returns `deleted`.
+    5. If already retracted (`retractedAt != null`), returns `retracted`.
+  - Action-specific rules:
+    - `canEdit`: The latest version's plaintext must decode to a `TEXT` payload (`not_text` if image/media); text must not be empty/whitespace (`empty`) and must differ from current text (`unchanged`).
+    - `canDelete`: Message status must NOT be `READ` (`already_read` if read).
+    - `canRetract`: Message status MUST be `READ` (`not_read` if unread or delivered).
+
+### Lifecycle Invariants
+
+1. **Edits Append New Versions**: An edit creates version $n + 1$ with action `EDIT` and never overwrites earlier versions. Plaintext history is preserved in local storage.
+2. **Delete Erases Content Permanently**: Allowed only before recipient reads. Erases plaintext across all versions (`plaintext: ""`), sets `deletedAt`, purges any raw ciphertext envelope in `failedEnvelopes`, and leaves a tombstone.
+3. **Retract Collapses Presentation**: Allowed only after recipient reads. Sets `retractedAt` timestamp, preserves existing plaintexts, and prevents any further edit or deletion.
+4. **Tombstone Permanence**: Once deleted, subsequent `EDIT` frames are ignored. A retracted message can neither be edited nor deleted.
+5. **Echo Ordering & Local-First Semantics**:
+   - `sendEdit`: Local-first after write. Because the server pushes the `EDIT` frame only to the recipient, the sender stores the new version locally immediately upon successful socket transmission. Concurrent edits acquire the per-peer lock to compute sequential version numbers in send order.
+   - `sendDelete` and `sendRetract`: Server-confirmed. The sender does not modify local records on socket send. Deletion and retraction take effect when the server echoes the `DELETE` or `RETRACT` frame back to both participants.
+6. **Decryption Failures on EDIT**:
+   - Inbound `EDIT` frames from peers are decrypted inside the per-peer lock.
+   - If decryption or payload parsing fails, the error is classified via `classifyDecryptError(err)` and emitted as a `decryptFailed` event with `{ kind: "EDIT", messageId, versionNo, code }`.
+   - In accordance with the security model, corrupted or failed edits are **never auto-retried** (subsequent valid edits continue normally).
+7. **Orphan & Protocol Error Containment**:
+   - `EDIT`, `DELETE`, or `RETRACT` frames received for unknown message IDs do not throw or corrupt local state; they emit `orphanEvent` with `{ kind, messageId }`.
+   - Server `ERROR` frames lacking a `client_msg_id` correlate to connection-level or protocol errors and emit `protocolError` with `{ code, message }` without throwing.

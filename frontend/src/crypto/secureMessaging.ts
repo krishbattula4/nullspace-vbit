@@ -2,21 +2,54 @@ import type { SessionManager } from "./session";
 import type {
   MessageStore,
   MessageRecord,
+  MessageStatus,
   DecryptErrorCode,
 } from "../store/messageStore";
 import {
   type ClientFrame,
   type ServerFrame,
   messageFrame,
+  editFrame,
+  deleteFrame,
+  retractFrame,
 } from "../lib/protocol";
 import {
   encodeMessagePayload,
   decodeMessagePayload,
   type MessagePayload,
+  MessagePayloadError,
 } from "./messagePayload";
 import { classifyDecryptError } from "./decryptErrors";
 
-export type SecureMessengerEvent = "message" | "update" | "decryptFailed";
+export type MessageActionErrorCode =
+  | "not_found"
+  | "not_sender"
+  | "not_confirmed"
+  | "deleted"
+  | "retracted"
+  | "not_text"
+  | "empty"
+  | "unchanged"
+  | "already_read"
+  | "not_read";
+
+export class MessageActionError extends Error {
+  readonly code: MessageActionErrorCode;
+
+  constructor(code: MessageActionErrorCode, message?: string) {
+    super(message ?? code);
+    this.name = "MessageActionError";
+    this.code = code;
+    Object.setPrototypeOf(this, MessageActionError.prototype);
+  }
+}
+
+export type SecureMessengerEvent =
+  | "message"
+  | "update"
+  | "decryptFailed"
+  | "orphanEvent"
+  | "protocolError";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- event data carries varying payload structures
 export type SecureMessengerEventHandler = (data?: any) => void | Promise<void>;
@@ -50,7 +83,56 @@ export class SecureMessenger {
     this.newId = options.newId ?? (() => crypto.randomUUID());
   }
 
-  on(event: SecureMessengerEvent, handler: SecureMessengerEventHandler): () => void {
+  on(
+    event: "message",
+    handler: (data: MessageRecord & { payload?: MessagePayload }) => void | Promise<void>,
+  ): () => void;
+  on(
+    event: "update",
+    handler: (data: {
+      messageId?: string;
+      clientMsgId?: string;
+      versionNo?: number;
+      deleted?: boolean;
+      retracted?: boolean;
+      status?: MessageStatus;
+      code?: string;
+      detail?: string;
+    }) => void | Promise<void>,
+  ): () => void;
+  on(
+    event: "decryptFailed",
+    handler: (data: {
+      messageId: string;
+      conversationId?: string;
+      senderId?: string;
+      kind?: "MESSAGE" | "EDIT";
+      versionNo?: number;
+      code: DecryptErrorCode;
+      error?: unknown;
+    }) => void | Promise<void>,
+  ): () => void;
+  on(
+    event: "orphanEvent",
+    handler: (data: {
+      kind: "EDIT" | "DELETE" | "RETRACT";
+      messageId: string;
+    }) => void | Promise<void>,
+  ): () => void;
+  on(
+    event: "protocolError",
+    handler: (data: { code: string; detail?: string }) => void | Promise<void>,
+  ): () => void;
+  on(
+    event: SecureMessengerEvent,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- overloaded event signatures
+    handler: (data?: any) => void | Promise<void>,
+  ): () => void;
+  on(
+    event: SecureMessengerEvent,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- overloaded event signatures
+    handler: (data?: any) => void | Promise<void>,
+  ): () => void {
     let handlers = this.listeners.get(event);
     if (!handlers) {
       handlers = new Set();
@@ -142,6 +224,7 @@ export class SecureMessenger {
     payload: MessagePayload,
   ): Promise<{ clientMsgId: string }> {
     return this.withPeerLock(peerId, async () => {
+
       // a. clientMsgId = newId(); plaintext = encodeMessagePayload(payload)
       const clientMsgId = this.newId();
       const plaintext = encodeMessagePayload(payload);
@@ -190,6 +273,176 @@ export class SecureMessenger {
       }
 
       return { clientMsgId };
+    });
+  }
+
+  async canEdit(
+    messageId: string,
+  ): Promise<{ allowed: true } | { allowed: false; reason: MessageActionErrorCode }> {
+    const msg = await this.messages.getMessage(messageId);
+    if (!msg) {
+      return { allowed: false, reason: "not_found" };
+    }
+    if (msg.senderId !== this.userId) {
+      return { allowed: false, reason: "not_sender" };
+    }
+    if (msg.status === "SENDING" || msg.status === "FAILED") {
+      return { allowed: false, reason: "not_confirmed" };
+    }
+    if (msg.deletedAt) {
+      return { allowed: false, reason: "deleted" };
+    }
+    if (msg.retractedAt) {
+      return { allowed: false, reason: "retracted" };
+    }
+
+    const versions = await this.messages.getVersions(messageId);
+    const latest = versions[versions.length - 1];
+    if (!latest || !latest.plaintext) {
+      return { allowed: false, reason: "not_text" };
+    }
+    try {
+      const payload = decodeMessagePayload(latest.plaintext);
+      if (payload.type !== "TEXT") {
+        return { allowed: false, reason: "not_text" };
+      }
+    } catch {
+      return { allowed: false, reason: "not_text" };
+    }
+
+    return { allowed: true };
+  }
+
+  async canDelete(
+    messageId: string,
+  ): Promise<{ allowed: true } | { allowed: false; reason: MessageActionErrorCode }> {
+    const msg = await this.messages.getMessage(messageId);
+    if (!msg) {
+      return { allowed: false, reason: "not_found" };
+    }
+    if (msg.senderId !== this.userId) {
+      return { allowed: false, reason: "not_sender" };
+    }
+    if (msg.status === "SENDING" || msg.status === "FAILED") {
+      return { allowed: false, reason: "not_confirmed" };
+    }
+    if (msg.deletedAt) {
+      return { allowed: false, reason: "deleted" };
+    }
+    if (msg.retractedAt) {
+      return { allowed: false, reason: "retracted" };
+    }
+    if (msg.status === "READ") {
+      return { allowed: false, reason: "already_read" };
+    }
+
+    return { allowed: true };
+  }
+
+  async canRetract(
+    messageId: string,
+  ): Promise<{ allowed: true } | { allowed: false; reason: MessageActionErrorCode }> {
+    const msg = await this.messages.getMessage(messageId);
+    if (!msg) {
+      return { allowed: false, reason: "not_found" };
+    }
+    if (msg.senderId !== this.userId) {
+      return { allowed: false, reason: "not_sender" };
+    }
+    if (msg.status === "SENDING" || msg.status === "FAILED") {
+      return { allowed: false, reason: "not_confirmed" };
+    }
+    if (msg.deletedAt) {
+      return { allowed: false, reason: "deleted" };
+    }
+    if (msg.retractedAt) {
+      return { allowed: false, reason: "retracted" };
+    }
+    if (msg.status !== "READ") {
+      return { allowed: false, reason: "not_read" };
+    }
+
+    return { allowed: true };
+  }
+
+  async sendEdit(
+    // Kept for a symmetric API with sendText; the EDIT frame itself carries only the message id.
+    _conversationId: string,
+    peerId: string,
+    messageId: string,
+    newText: string,
+  ): Promise<{ versionNo: number }> {
+    return this.withPeerLock(peerId, async () => {
+
+      const can = await this.canEdit(messageId);
+      if (!can.allowed) {
+        throw new MessageActionError(can.reason);
+      }
+
+      if (typeof newText !== "string" || newText.trim().length === 0) {
+        throw new MessageActionError("empty");
+      }
+
+      // Check unchanged against latest version
+      const versions = await this.messages.getVersions(messageId);
+      const latest = versions[versions.length - 1];
+      if (latest && latest.plaintext) {
+        try {
+          const currentPayload = decodeMessagePayload(latest.plaintext);
+          if (currentPayload.type === "TEXT" && currentPayload.text === newText) {
+            throw new MessageActionError("unchanged");
+          }
+        } catch (err) {
+          if (err instanceof MessageActionError) throw err;
+        }
+      }
+
+      // If over MAX_TEXT_CHARS, let MessagePayloadError propagate
+      const plaintext = encodeMessagePayload({ type: "TEXT", text: newText });
+
+      // Encrypt with sessions.encrypt(peerId, plaintext) (IdentityChangedError propagates untouched)
+      const envelope = await this.sessions.encrypt(peerId, plaintext);
+
+      // Send edit frame over wire
+      const frame = editFrame(messageId, envelope.type, envelope.body);
+      await this.send(frame);
+
+      // ONLY if send did not throw, add the new version locally
+      const currentVersions = await this.messages.getVersions(messageId);
+      const maxVer = currentVersions.reduce((max, v) => Math.max(max, v.versionNo), 0);
+      const versionNo = maxVer + 1;
+      const createdAt = this.now().toISOString();
+
+      await this.messages.addVersion({
+        messageId,
+        versionNo,
+        plaintext,
+        action: "EDIT",
+        createdAt,
+      });
+
+      this.emit("update", { messageId, versionNo });
+      return { versionNo };
+    });
+  }
+
+  async sendDelete(peerId: string, messageId: string): Promise<void> {
+    return this.withPeerLock(peerId, async () => {
+      const can = await this.canDelete(messageId);
+      if (!can.allowed) {
+        throw new MessageActionError(can.reason);
+      }
+      await this.send(deleteFrame(messageId));
+    });
+  }
+
+  async sendRetract(peerId: string, messageId: string): Promise<void> {
+    return this.withPeerLock(peerId, async () => {
+      const can = await this.canRetract(messageId);
+      if (!can.allowed) {
+        throw new MessageActionError(can.reason);
+      }
+      await this.send(retractFrame(messageId));
     });
   }
 
@@ -365,6 +618,7 @@ export class SecureMessenger {
       case "MESSAGE": {
         try {
           await this.withPeerLock(frame.sender_id, async () => {
+
             // (1) if messages already has version 1 for frame.message_id, ignore it and do NOT call decrypt
             const versions = await this.messages.getVersions(frame.message_id);
             if (versions.some((v) => v.versionNo === 1)) {
@@ -485,6 +739,169 @@ export class SecureMessenger {
         break;
       }
 
+      case "EDIT": {
+        try {
+          const message = await this.messages.getMessage(frame.message_id);
+          if (!message) {
+            this.emit("orphanEvent", { kind: "EDIT", messageId: frame.message_id });
+            break;
+          }
+
+          if (message.senderId === this.userId) {
+            // Server misbehaviour: the server never sends the sender its own edit
+            break;
+          }
+
+          await this.withPeerLock(message.senderId, async () => {
+            const currentMsg = await this.messages.getMessage(frame.message_id);
+            if (!currentMsg) {
+              this.emit("orphanEvent", { kind: "EDIT", messageId: frame.message_id });
+              return;
+            }
+
+            if (currentMsg.deletedAt || currentMsg.retractedAt) {
+              return;
+            }
+
+            const versions = await this.messages.getVersions(frame.message_id);
+            if (versions.some((v) => v.versionNo === frame.version_no)) {
+              return;
+            }
+
+            try {
+              const plaintext = await this.sessions.decrypt(currentMsg.senderId, {
+                type: frame.ctype,
+                body: frame.body,
+              });
+              const payload = decodeMessagePayload(plaintext);
+              if (payload.type !== "TEXT") {
+                throw new MessagePayloadError("EDIT payload must be TEXT");
+              }
+
+              await this.messages.addVersion({
+                messageId: frame.message_id,
+                versionNo: frame.version_no,
+                plaintext,
+                action: "EDIT",
+                createdAt: frame.edited_at,
+              });
+              this.emit("update", {
+                messageId: frame.message_id,
+                versionNo: frame.version_no,
+              });
+            } catch (err) {
+              const code = classifyDecryptError(err);
+              this.emit("decryptFailed", {
+                messageId: frame.message_id,
+                kind: "EDIT",
+                versionNo: frame.version_no,
+                code,
+                error: err,
+              });
+            }
+          });
+        } catch {
+          // Never throw
+        }
+        break;
+      }
+
+      case "DELETE": {
+        try {
+          const message = await this.messages.getMessage(frame.message_id);
+          if (!message) {
+            this.emit("orphanEvent", { kind: "DELETE", messageId: frame.message_id });
+            break;
+          }
+
+          const applyDelete = async () => {
+            const currentMsg = await this.messages.getMessage(frame.message_id);
+            if (!currentMsg) {
+              this.emit("orphanEvent", { kind: "DELETE", messageId: frame.message_id });
+              return;
+            }
+            if (currentMsg.retractedAt) {
+              return;
+            }
+
+            await this.messages.markDeleted(frame.message_id, {
+              at: this.now().toISOString(),
+              by: currentMsg.senderId,
+            });
+            this.emit("update", { messageId: frame.message_id, deleted: true });
+          };
+
+          if (message.senderId !== this.userId) {
+            await this.withPeerLock(message.senderId, applyDelete);
+          } else {
+            await applyDelete();
+          }
+        } catch {
+          // Never throw
+        }
+        break;
+      }
+
+      case "RETRACT": {
+        try {
+          const message = await this.messages.getMessage(frame.message_id);
+          if (!message) {
+            this.emit("orphanEvent", { kind: "RETRACT", messageId: frame.message_id });
+            break;
+          }
+
+          const applyRetract = async () => {
+            const currentMsg = await this.messages.getMessage(frame.message_id);
+            if (!currentMsg) {
+              this.emit("orphanEvent", { kind: "RETRACT", messageId: frame.message_id });
+              return;
+            }
+            if (currentMsg.deletedAt) {
+              return;
+            }
+
+            await this.messages.markRetracted(frame.message_id, {
+              at: this.now().toISOString(),
+              by: currentMsg.senderId,
+            });
+            this.emit("update", { messageId: frame.message_id, retracted: true });
+          };
+
+          if (message.senderId !== this.userId) {
+            await this.withPeerLock(message.senderId, applyRetract);
+          } else {
+            await applyRetract();
+          }
+        } catch {
+          // Never throw
+        }
+        break;
+      }
+
+      case "DELIVERED": {
+        try {
+          const newStatus = await this.messages.setStatus(frame.message_id, "DELIVERED");
+          if (newStatus) {
+            this.emit("update", { messageId: frame.message_id, status: newStatus });
+          }
+        } catch {
+          // Never throw
+        }
+        break;
+      }
+
+      case "READ": {
+        try {
+          const newStatus = await this.messages.setStatus(frame.message_id, "READ");
+          if (newStatus) {
+            this.emit("update", { messageId: frame.message_id, status: newStatus });
+          }
+        } catch {
+          // Never throw
+        }
+        break;
+      }
+
       case "ACK": {
         await this.messages.confirmSent(frame.client_msg_id, {
           messageId: frame.message_id,
@@ -507,12 +924,17 @@ export class SecureMessenger {
             code: frame.code,
             detail: frame.detail,
           });
+        } else {
+          this.emit("protocolError", {
+            code: frame.code,
+            detail: frame.detail,
+          });
         }
         break;
       }
 
       default:
-        // Every other frame type (DELIVERED, READ, EDIT, DELETE, RETRACT, TYPING, PRESENCE) is ignored
+        // Every other frame type (TYPING, PRESENCE) is ignored
         break;
     }
   }
