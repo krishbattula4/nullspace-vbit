@@ -2,6 +2,7 @@ import { KeyHelper } from "@privacyresearch/libsignal-protocol-typescript";
 import { IndexedDBSignalStore } from "./IndexedDBSignalStore";
 import { generateSignedPreKey, generateOneTimePreKeys } from "./keys";
 import { toBase64, type PublicPreKeyBundle } from "./bundle";
+import { PrekeyState } from "./prekeyMaintenance";
 
 export const SIGNED_PREKEY_ID_START = 1;
 export const ONE_TIME_PREKEY_BATCH = 100;
@@ -55,10 +56,24 @@ export async function provisionKeys(
   const existingPreKeyIds = await signalStore.listPreKeyIds();
   const shortfall = Math.max(0, ONE_TIME_PREKEY_BATCH - existingPreKeyIds.length);
   if (shortfall > 0) {
-    const highestId =
-      existingPreKeyIds.length > 0 ? existingPreKeyIds[existingPreKeyIds.length - 1] : 0;
-    const startId = highestId + 1;
+    const prekeyState = new PrekeyState(userId);
+    const state = await prekeyState.get();
+    let startId: number;
+    if (state && typeof state.nextPreKeyId === "number") {
+      startId = state.nextPreKeyId;
+    } else {
+      const highestId =
+        existingPreKeyIds.length > 0 ? existingPreKeyIds[existingPreKeyIds.length - 1] : 0;
+      startId = highestId + 1;
+    }
     await generateOneTimePreKeys(signalStore, startId, shortfall);
+    const nextPreKeyId = startId + shortfall;
+    await prekeyState.save({
+      nextPreKeyId,
+      activeSignedPreKeyId: state?.activeSignedPreKeyId ?? null,
+      lastRotatedAt: state?.lastRotatedAt ?? null,
+    });
+    prekeyState.close();
   }
 
   // 4. Build public prekey bundle (never include private keys)

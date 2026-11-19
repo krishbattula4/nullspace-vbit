@@ -497,3 +497,27 @@ interface MediaPayload {
 4. **Server isolation (Asset A6)**: The server receives only multipart form data containing `conversation_id` and the encrypted `file` (`blob.bin`). It is structurally impossible for encryption keys or IVs to reach the server.
 
 
+
+## Prekey maintenance
+
+Nullspace clients autonomously replenish one-time prekeys and rotate signed prekeys via periodic maintenance runs (`maintainPrekeys`).
+
+### Replenishment Policy
+
+- **Polling**: Clients query `GET /keys/count` to check server inventory (`one_time_prekeys` available and current `signed_prekey_id`). Network failures or non-2xx responses cause maintenance to return `{ status: "skipped" }` without state changes or throwing.
+- **Low-Water Mark**: When available one-time prekeys drop below `LOW_WATER_MARK = 20`, the client replenishes `REPLENISH_BATCH = 100` new prekeys starting from `PrekeyState.nextPreKeyId`.
+- **Pre-Upload Counter Persistence**: Counter advancement is committed to IndexedDB (`nullspace-prekeys-${userId}`) *before* initiating the network upload to ensure crashes never lead to key ID reuse.
+- **Upload Contract**: One-time prekeys are uploaded via `PUT /keys/bundle` in chunks of at most `MAX_PER_UPLOAD = 200` keys alongside the newest confirmed signed prekey.
+- **Conflict Handling**: If the server rejects an upload with HTTP 409 `prekey_id_conflict` (due to an existing key ID with a different public key), the client advances `nextPreKeyId` by 1000, updates state, and retries once. If the retry fails, `{ status: "failed" }` is returned cleanly.
+
+### Signed Prekey Rotation Policy
+
+- **Rotation Schedule**: Clients rotate signed prekeys every `SIGNED_PREKEY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000` (7 days). On first run, `lastRotatedAt` is recorded without rotating.
+- **Upload & Confirmation**: Rotation publishes a new signed prekey with `id = (highest existing signed prekey id) + 1` and an empty `oneTimePreKeys` array to `PUT /keys/bundle`. Only upon receiving HTTP 200 does the client update `activeSignedPreKeyId` and `lastRotatedAt`.
+- **Upload Failure Reuse**: If a rotation PUT fails, the newly generated signed prekey is retained in the local store and reused on the next maintenance run without burning additional key IDs.
+- **Two-Key Retention Window**: After a successful rotation, the client purges from local storage all signed prekeys strictly older than the *previous* active signed prekey (`id < previousActiveSignedPreKeyId`). This retains exactly the current and previous signed prekeys so that delayed or out-of-order prekey messages decrypt successfully.
+
+### Concurrency and Cross-Tab Coordination
+
+- **Single Flight**: Concurrent maintenance calls within the same process are deduplicated via an in-process Promise map (`inFlightMap`).
+- **Web Locks API**: Cross-tab concurrency is serialized using Web Locks API lock `nullspace-prekeys-${userId}`, falling back to in-process synchronization in non-supporting environments.
