@@ -247,6 +247,94 @@ async def test_message_routing_duplicate_client_msg_id_idempotency(
         assert len(vers) == 1
 
 
+async def test_message_routing_duplicate_ack_normalized_for_delivered_status(
+    db_session: AsyncSession,
+) -> None:
+    """Duplicate client_msg_id for a DELIVERED message returns ACK status SENT without errors."""
+    with TestClient(app) as client:
+        uid_a, token_a, _ = _create_user_and_tokens(client, "alice_deliv")
+        uid_b, token_b, _ = _create_user_and_tokens(client, "bob_deliv")
+
+        conv = await _create_conversation(db_session, uuid.UUID(uid_a), uuid.UUID(uid_b))
+        client_msg_id = str(uuid.uuid4())
+        b64_body = base64.b64encode(b"delivered_regression_payload").decode("ascii")
+
+        with client.websocket_connect("/ws") as ws_a:
+            ws_a.send_json({"type": "AUTH", "token": token_a})
+            assert ws_a.receive_json()["type"] == "AUTH_OK"
+
+            with client.websocket_connect("/ws") as ws_b:
+                ws_b.send_json({"type": "AUTH", "token": token_b})
+                assert ws_b.receive_json()["type"] == "AUTH_OK"
+
+                msg_frame = {
+                    "v": 1,
+                    "type": "MESSAGE",
+                    "conversation_id": str(conv.id),
+                    "client_msg_id": client_msg_id,
+                    "ctype": 1,
+                    "body": b64_body,
+                }
+
+                # 1. First transmission from sender
+                ws_a.send_json(msg_frame)
+                ack1 = ws_a.receive_json()
+                assert ack1["type"] == "ACK"
+                assert ack1["status"] == "SENT"
+                server_msg_id = ack1["message_id"]
+
+                # Recipient receives initial message
+                delivered = ws_b.receive_json()
+                assert delivered["type"] == "MESSAGE"
+                assert delivered["message_id"] == server_msg_id
+
+                # 2. Ensure original Message and MessageVersion exist in DB
+                stmt_msg = select(Message).where(
+                    Message.sender_id == uuid.UUID(uid_a),
+                    Message.client_msg_id == uuid.UUID(client_msg_id),
+                )
+                msg = (await db_session.execute(stmt_msg)).scalar_one()
+                assert str(msg.id) == server_msg_id
+
+                stmt_ver = select(MessageVersion).where(MessageVersion.message_id == msg.id)
+                vers = list((await db_session.execute(stmt_ver)).scalars().all())
+                assert len(vers) == 1
+
+                # 3. Change stored Message status to DELIVERED using existing enum
+                msg.status = MessageStatus.DELIVERED
+                await db_session.commit()
+                await db_session.refresh(msg)
+                assert msg.status == MessageStatus.DELIVERED
+
+                # 4. Send the same client_msg_id again from the same sender
+                ws_a.send_json(msg_frame)
+
+                # 5. Verify handler returns ACK with original IDs and status SENT
+                ack2 = ws_a.receive_json()
+                assert ack2["type"] == "ACK"
+                assert ack2["client_msg_id"] == client_msg_id
+                assert ack2["message_id"] == server_msg_id
+                assert ack2["status"] == "SENT"
+
+                # 8. Verify the duplicate is not pushed to the recipient again
+                ws_b.send_json({"type": "PING"})
+                assert ws_b.receive_json() == {"type": "PONG"}
+
+                # 9. Verify handler does not raise exception or close WebSocket
+                ws_a.send_json({"type": "PING"})
+                assert ws_a.receive_json() == {"type": "PONG"}
+
+        # 6. Verify exactly one Message row exists for that sender/client_msg_id
+        all_msgs = list((await db_session.execute(stmt_msg)).scalars().all())
+        assert len(all_msgs) == 1
+        # DB status remains DELIVERED
+        assert all_msgs[0].status == MessageStatus.DELIVERED
+
+        # 7. Verify exactly one MessageVersion row exists for the original message
+        all_vers = list((await db_session.execute(stmt_ver)).scalars().all())
+        assert len(all_vers) == 1
+
+
 # ============================================================================
 # Test 4 — Sender outside conversation
 # ============================================================================

@@ -86,15 +86,15 @@ async def handle_message_frame(
         existing_msg = res_existing.scalar_one_or_none()
 
         if existing_msg is not None:
-            status_val = (
-                existing_msg.status.value
-                if isinstance(existing_msg.status, MessageStatus)
-                else str(existing_msg.status)
+            ack_status = (
+                "QUEUED"
+                if existing_msg.status == MessageStatus.QUEUED
+                else "SENT"
             )
             ack = ack_frame(
                 client_msg_id=frame.client_msg_id,
                 message_id=str(existing_msg.id),
-                status=status_val,
+                status=ack_status,
             )
             await websocket.send_json(ack)
             return
@@ -147,15 +147,15 @@ async def handle_message_frame(
             res_existing = await session.execute(stmt_existing)
             existing_msg = res_existing.scalar_one_or_none()
             if existing_msg is not None:
-                status_val = (
-                    existing_msg.status.value
-                    if isinstance(existing_msg.status, MessageStatus)
-                    else str(existing_msg.status)
+                ack_status = (
+                    "QUEUED"
+                    if existing_msg.status == MessageStatus.QUEUED
+                    else "SENT"
                 )
                 ack = ack_frame(
                     client_msg_id=frame.client_msg_id,
                     message_id=str(existing_msg.id),
-                    status=status_val,
+                    status=ack_status,
                 )
                 await websocket.send_json(ack)
                 return
