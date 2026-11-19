@@ -444,3 +444,33 @@ Nullspace tracks each peer contact's verification status locally on the device u
 - **Incoming prekey message with a new identity key**: record `KEY_CHANGED` in the `VerificationStore`, accept the new key in the Signal store, decrypt and deliver the message. The user sees a red "Key changed" state and an in-chat warning (P4.6); messages are never silently dropped.
 - **Outgoing session setup with a new identity key**: record `KEY_CHANGED`, do NOT send. The caller gets `IdentityChangedError`. The UI offers "Continue with new key", which calls `acceptNewIdentity`; the state stays `KEY_CHANGED` until the user re-verifies.
 
+## Media encryption
+
+Media attachments (images up to 5 MiB: `image/png`, `image/jpeg`, `image/gif`, `image/webp`) are encrypted client-side using WebCrypto AES-GCM (256-bit key, 96-bit IV) before upload.
+
+The plaintext encryption key and IV travel exclusively to the recipient inside an end-to-end Signal-encrypted message envelope, never to the media storage server (fulfilling Asset A6 of `docs/threat-model.md`).
+
+### Media payload structure (inside Signal envelope)
+
+When an image is shared, the sender uploads the encrypted blob to `POST /media` (receiving a canonical UUID `media_id`) and places the following payload inside the Signal message:
+
+```typescript
+interface MediaPayload {
+  type: "IMAGE";
+  media_id: string; // Canonical lowercase UUID of the ciphertext blob on server
+  key: string;      // Base64 encoding of 32-byte AES-256-GCM symmetric key
+  iv: string;       // Base64 encoding of 12-byte initialization vector (96-bit)
+  sha256: string;   // Lowercase hex SHA-256 hash of the ciphertext (64 chars)
+  mime: string;     // Declared MIME type: image/png, image/jpeg, image/gif, or image/webp
+  size: number;     // Plaintext size in bytes (1 to 5242880)
+}
+```
+
+### Integrity rule & verification policy
+
+1. **Pre-decryption integrity verification**: Before attempting AES-GCM decryption, the client MUST recompute the SHA-256 digest over the downloaded ciphertext bytes and compare it with `payload.sha256` using constant-time comparison.
+2. **Strict rejection on integrity failure**: If the recomputed SHA-256 digest does not match `payload.sha256`, the client throws `MediaIntegrityError` immediately without invoking `crypto.subtle.decrypt`. Decryption is never attempted on tampered or corrupted ciphertext.
+3. **Decryption error handling**: Any failure during key/IV decoding or AES-GCM decryption (e.g. authentication tag mismatch, bad key, bad IV) throws `MediaDecryptError`. Partial data is never returned.
+4. **Server isolation (Asset A6)**: The server receives only multipart form data containing `conversation_id` and the encrypted `file` (`blob.bin`). It is structurally impossible for encryption keys or IVs to reach the server.
+
+
