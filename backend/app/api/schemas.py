@@ -5,6 +5,9 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.models.message import MessageStatus
+from app.models.message_version import VersionAction
+
 
 class RegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=32, pattern=r"^[A-Za-z0-9_]+$")
@@ -71,3 +74,50 @@ class RefreshRequest(BaseModel):
 
 class LogoutRequest(BaseModel):
     refresh_token: str = Field(min_length=1)
+
+
+class ConversationCreateRequest(BaseModel):
+    peer_id: uuid.UUID
+
+
+class ConversationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    user_a_id: uuid.UUID
+    user_b_id: uuid.UUID
+    peer: UserPublic
+    verified_by_me: bool
+    verified_by_peer: bool
+    created_at: datetime
+    last_message_at: datetime | None = None
+    unread_count: int = 0
+
+
+class MessageVersionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    message_id: uuid.UUID
+    version_no: int
+    ctype: int
+    ciphertext: str
+    action: VersionAction
+    actor_id: uuid.UUID
+    created_at: datetime
+    erased_at: datetime | None = None
+
+
+class MessageResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    conversation_id: uuid.UUID
+    sender_id: uuid.UUID
+    client_msg_id: uuid.UUID
+    current_version: int
+    status: MessageStatus
+    created_at: datetime
+    delivered_at: datetime | None = None
+    read_at: datetime | None = None
+    versions: list[MessageVersionResponse] = Field(default_factory=list)
