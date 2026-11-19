@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import auth, health, ws
+from app.api import auth, conversations, health, users, ws
 from app.core.config import get_settings
 from app.core.db import dispose_engine
 
@@ -44,7 +44,8 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(ws.router)
-    # P2: conversations router
+    app.include_router(users.router)
+    app.include_router(conversations.router)
     # P3: keys router
     return app
 

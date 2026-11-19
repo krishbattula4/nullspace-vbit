@@ -268,6 +268,276 @@ Error details:
 
 ---
 
+## Users
+
+### Search Users
+
+Searches registered users by username prefix (case-insensitive). The authenticated caller is automatically excluded from results.
+
+- **Method**: `GET`
+- **Path**: `/users/search`
+- **Headers**:
+  - `Authorization: Bearer <access_token>` (Required)
+
+#### Query Parameters
+
+| Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|
+| `q` | string | Yes | None | 2 to 32 characters | Username prefix search query. `%` and `_` are treated as literal characters. |
+
+#### Responses
+
+##### 200 OK
+Returned when the query is valid and search executes.
+
+**Response Body**: Array of `UserPublic` objects (maximum 20 items, sorted by `username` ascending).
+
+```json
+[
+  {
+    "user_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    "username": "alex_ander",
+    "display_name": "Alex",
+    "created_at": "2026-11-09T12:00:00Z"
+  },
+  {
+    "user_id": "3f8b1c4e-5a2d-4e9f-8c3b-1a2b3c4d5e6f",
+    "username": "alice_wonder",
+    "display_name": "Alice Wonder",
+    "created_at": "2026-11-09T12:05:00Z"
+  }
+]
+```
+
+##### 401 Unauthorized
+Returned when authentication fails. Detail: `not_authenticated`, `token_expired`, or `invalid_token`.
+
+##### 422 Unprocessable Entity
+Returned when `q` is shorter than 2 characters, longer than 32 characters, or omitted.
+
+---
+
+## Conversations
+
+### Create or Retrieve Conversation
+
+Creates a new two-party conversation between the authenticated user and a specified peer, or retrieves the existing conversation if one already exists.
+
+- **Method**: `POST`
+- **Path**: `/conversations`
+- **Headers**:
+  - `Authorization: Bearer <access_token>` (Required)
+- **Content-Type**: `application/json`
+
+#### Request Body Schema
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `peer_id` | UUID | Yes | The target user ID to start or resume a conversation with. |
+
+#### Request Example
+```json
+{
+  "peer_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+}
+```
+
+#### Responses
+
+##### 201 Created
+Returned when a new conversation channel is created.
+
+##### 200 OK
+Returned when a conversation channel between the two users already exists.
+
+**Response Body**:
+```json
+{
+  "id": "e3b0c442-98fc-1c14-9afbf4c8996fb924",
+  "user_a_id": "11111111-1111-1111-1111-111111111111",
+  "user_b_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "peer": {
+    "user_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    "username": "bob",
+    "display_name": "Bob Builder",
+    "created_at": "2026-11-09T12:00:00Z"
+  },
+  "verified_by_me": false,
+  "verified_by_peer": false,
+  "created_at": "2026-11-19T10:00:00Z",
+  "last_message_at": null,
+  "unread_count": 0
+}
+```
+
+> [!NOTE]
+> User IDs are always canonically sorted so that `user_a_id < user_b_id`. Concurrent creation race conditions are caught and handled atomically.
+
+##### 400 Bad Request
+Returned when `peer_id` equals the authenticated user's ID.
+
+**Response Body**:
+```json
+{
+  "detail": "cannot_chat_with_self"
+}
+```
+
+##### 401 Unauthorized
+Returned when authentication fails. Detail: `not_authenticated`, `token_expired`, or `invalid_token`.
+
+##### 404 Not Found
+Returned when `peer_id` does not match any registered user.
+
+**Response Body**:
+```json
+{
+  "detail": "user_not_found"
+}
+```
+
+##### 422 Unprocessable Entity
+Returned when request parameters fail schema validation (e.g. malformed UUID).
+
+---
+
+### List Conversations
+
+Lists all conversations involving the authenticated user, ordered by newest activity first.
+
+- **Method**: `GET`
+- **Path**: `/conversations`
+- **Headers**:
+  - `Authorization: Bearer <access_token>` (Required)
+
+#### Responses
+
+##### 200 OK
+Returned on successful query.
+
+**Response Body**: Array of `ConversationResponse` objects.
+
+```json
+[
+  {
+    "id": "e3b0c442-98fc-1c14-9afbf4c8996fb924",
+    "user_a_id": "11111111-1111-1111-1111-111111111111",
+    "user_b_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    "peer": {
+      "user_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+      "username": "bob",
+      "display_name": "Bob Builder",
+      "created_at": "2026-11-09T12:00:00Z"
+    },
+    "verified_by_me": true,
+    "verified_by_peer": false,
+    "created_at": "2026-11-19T10:00:00Z",
+    "last_message_at": "2026-11-19T10:30:00Z",
+    "unread_count": 2
+  }
+]
+```
+
+##### 401 Unauthorized
+Returned when authentication fails. Detail: `not_authenticated`, `token_expired`, or `invalid_token`.
+
+---
+
+### Get Message History
+
+Retrieves keyset-paginated message history for a conversation, ordered newest first by `(created_at, id)` descending. Each message contains nested versions ordered by `version_no` ascending.
+
+- **Method**: `GET`
+- **Path**: `/conversations/{id}/messages`
+- **Headers**:
+  - `Authorization: Bearer <access_token>` (Required)
+
+#### Path Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `id` | UUID | Yes | Unique conversation ID. |
+
+#### Query Parameters
+
+| Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|
+| `before` | string | No | None | Valid message UUID or composite `<iso_timestamp>_<uuid>` | Keyset pagination cursor. Only messages older than this pivot in `(created_at DESC, id DESC)` order are returned. Ambiguous raw timestamps without message UUIDs are rejected. |
+| `limit` | integer | No | 50 | 1 to 100 | Maximum number of messages to return per page. |
+
+#### Responses
+
+##### 200 OK
+Returned on successful query.
+
+**Response Body**: Array of `MessageResponse` objects with nested `MessageVersionResponse` items.
+
+```json
+[
+  {
+    "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "conversation_id": "e3b0c442-98fc-1c14-9afbf4c8996fb924",
+    "sender_id": "11111111-1111-1111-1111-111111111111",
+    "client_msg_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "current_version": 2,
+    "status": "SENT",
+    "created_at": "2026-11-19T10:05:00Z",
+    "delivered_at": null,
+    "read_at": null,
+    "versions": [
+      {
+        "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "message_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "version_no": 1,
+        "ctype": 3,
+        "ciphertext": "c2VjcmV0X3ByZWtleV9jaXBoZXJ0ZXh0",
+        "action": "CREATE",
+        "actor_id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-11-19T10:05:00Z",
+        "erased_at": null
+      },
+      {
+        "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+        "message_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "version_no": 2,
+        "ctype": 1,
+        "ciphertext": "c2VjcmV0X2VkaXRlZF9jaXBoZXJ0ZXh0",
+        "action": "EDIT",
+        "actor_id": "11111111-1111-1111-1111-111111111111",
+        "created_at": "2026-11-19T10:10:00Z",
+        "erased_at": null
+      }
+    ]
+  }
+]
+```
+
+> [!NOTE]
+> - `ciphertext` is Base64 encoded in responses.
+> - For tombstoned / erased versions (`action: DELETE`), `ciphertext` is returned as empty string `""` and `erased_at` contains the timestamp of deletion.
+> - Versions for all messages in the page are fetched in a single batched query to prevent N+1 queries.
+
+##### 401 Unauthorized
+Returned when authentication fails. Detail: `not_authenticated`, `token_expired`, or `invalid_token`.
+
+##### 404 Not Found
+Returned when the conversation does not exist or the authenticated user is not a participant in the conversation.
+
+> [!IMPORTANT]
+> To prevent conversation enumeration, requesting a conversation where the user is not a participant returns HTTP 404 `conversation_not_found`, never 403. Also returned if a UUID `before` cursor is not found (`cursor_not_found`).
+
+**Response Body**:
+```json
+{
+  "detail": "conversation_not_found"
+}
+```
+
+##### 422 Unprocessable Entity
+Returned when `limit` is outside the allowed range (1 to 100) or path/query parameters are invalid.
+
+---
+
 ## Security and Privacy Rules
 
 1. **Password Hashing**: Passwords are hashed using standard bcrypt (`$2b$`) with cost factor configured via `BCRYPT_ROUNDS` (defaults to 12).
