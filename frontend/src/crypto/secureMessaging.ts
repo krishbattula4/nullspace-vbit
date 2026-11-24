@@ -33,6 +33,7 @@ export interface ReconcileResult {
 
 export type MessageActionErrorCode =
   | "not_found"
+  | "imported"
   | "not_sender"
   | "not_confirmed"
   | "deleted"
@@ -314,6 +315,9 @@ export class SecureMessenger {
     if (!msg) {
       return { allowed: false, reason: "not_found" };
     }
+    if (msg.importedAt) {
+      return { allowed: false, reason: "imported" };
+    }
     if (msg.senderId !== this.userId) {
       return { allowed: false, reason: "not_sender" };
     }
@@ -351,6 +355,9 @@ export class SecureMessenger {
     if (!msg) {
       return { allowed: false, reason: "not_found" };
     }
+    if (msg.importedAt) {
+      return { allowed: false, reason: "imported" };
+    }
     if (msg.senderId !== this.userId) {
       return { allowed: false, reason: "not_sender" };
     }
@@ -376,6 +383,9 @@ export class SecureMessenger {
     const msg = await this.messages.getMessage(messageId);
     if (!msg) {
       return { allowed: false, reason: "not_found" };
+    }
+    if (msg.importedAt) {
+      return { allowed: false, reason: "imported" };
     }
     if (msg.senderId !== this.userId) {
       return { allowed: false, reason: "not_sender" };
