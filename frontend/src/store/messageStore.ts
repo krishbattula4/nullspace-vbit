@@ -45,6 +45,7 @@ export interface MessageRecord {
   retractedBy?: string;
   decryptFailed?: boolean;
   decryptErrorCode?: DecryptErrorCode;
+  importedAt?: string;
 }
 
 export interface VersionRecord {
